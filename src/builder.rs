@@ -7,7 +7,7 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::tree::{CachedAttrs, DirSources, NodeKind, NodeId, Tree, ROOT_ID};
+use crate::tree::{CachedAttrs, DirSources, FastMap, NodeKind, NodeId, Tree, ROOT_ID};
 
 /// Cap on recursive descent during scans. Protects against symlink loops
 /// when `follow_symlinks` is enabled.
@@ -108,24 +108,31 @@ pub fn apply_snapshot(
 ) {
     tree.extend_dir_sources(virtual_id, snap.physical.clone());
 
-    let virtual_children: Vec<(String, NodeId)> = match tree.get(virtual_id) {
+    // We only need the child ids to iterate; names + types come from
+    // `tree.get(child_id)` per-step. Cloning the (String, NodeId) Vec
+    // would burst thousands of String allocations under the write lock.
+    let virtual_child_ids: Vec<NodeId> = match tree.get(virtual_id) {
         Some(node) => match &node.kind {
-            NodeKind::Directory { ordered, .. } => ordered.clone(),
+            NodeKind::Directory { ordered, .. } => {
+                ordered.iter().map(|(_, id)| *id).collect()
+            }
             _ => return,
         },
         None => return,
     };
-    let virtual_names: HashSet<String> =
-        virtual_children.iter().map(|(n, _)| n.clone()).collect();
 
-    for (name, child_id) in &virtual_children {
+    let mut handled_names: HashSet<String> = HashSet::with_capacity(virtual_child_ids.len());
+
+    for child_id in &virtual_child_ids {
         let Some(child) = tree.get(*child_id) else { continue };
+        let name = child.name.clone(); // single clone per child, not full Vec
+        handled_names.insert(name.clone());
         match &child.kind {
             NodeKind::File { backing } => {
                 if !backing.starts_with(&snap.physical) {
                     continue;
                 }
-                match snap.children.get(name) {
+                match snap.children.get(&name) {
                     Some(EntrySnapshot::File { path, attrs }) if path == backing => {
                         if let Some(node) = tree.get_mut(*child_id) {
                             node.attrs = attrs.clone();
@@ -138,7 +145,7 @@ pub fn apply_snapshot(
                 }
             }
             NodeKind::Directory { sources, .. } => {
-                let child_phys = snap.physical.join(name);
+                let child_phys = snap.physical.join(&name);
                 let backed_here = match sources {
                     DirSources::Physical(paths) => paths.iter().any(|p| p == &child_phys),
                     DirSources::Synthetic => false,
@@ -146,7 +153,7 @@ pub fn apply_snapshot(
                 if !backed_here {
                     continue;
                 }
-                match snap.children.get(name) {
+                match snap.children.get(&name) {
                     Some(EntrySnapshot::Dir(sub)) => {
                         apply_snapshot(tree, *child_id, sub, config);
                     }
@@ -163,7 +170,7 @@ pub fn apply_snapshot(
     }
 
     for (name, entry) in &snap.children {
-        if virtual_names.contains(name) {
+        if handled_names.contains(name) {
             continue;
         }
         match entry {
@@ -189,13 +196,78 @@ pub fn apply_snapshot(
     }
 }
 
+/// Merge a `DirSnapshot` into the tree with **additive, first-root-wins**
+/// semantics. Used during initial build, where multiple `merge:` roots feed
+/// the same virtual share and conflicts are resolved by config order.
+///
+/// Dir-name collision: if a dir of this name already exists, descend into
+/// it (recursive merge of subtrees). File-name collision: keep the existing
+/// (earlier) entry; log a warning unless the existing's backing is the same
+/// path (which means we're re-applying our own work).
+pub fn merge_snapshot(
+    tree: &mut Tree,
+    virtual_id: NodeId,
+    snap: &DirSnapshot,
+    config: &Config,
+) {
+    tree.extend_dir_sources(virtual_id, snap.physical.clone());
+    tree.mark_unsorted(virtual_id);
+
+    for (name, entry) in &snap.children {
+        match entry {
+            EntrySnapshot::Dir(sub) => {
+                let existing = tree.child(virtual_id, name);
+                let child_id = if let Some(eid) = existing {
+                    if !tree.get(eid).map(|n| n.is_dir()).unwrap_or(false) {
+                        warn!(name=%name, "directory shadowed by earlier file with same name");
+                        continue;
+                    }
+                    eid
+                } else {
+                    match tree.add_child(
+                        virtual_id,
+                        name.clone(),
+                        empty_dir_kind(),
+                        sub.attrs.clone(),
+                    ) {
+                        Some(id) => id,
+                        None => continue,
+                    }
+                };
+                merge_snapshot(tree, child_id, sub, config);
+            }
+            EntrySnapshot::File { path, attrs } => {
+                let kind = NodeKind::File { backing: path.clone() };
+                if let Some(child_id) =
+                    tree.add_child(virtual_id, name.clone(), kind, attrs.clone())
+                {
+                    tree.index_file(path.clone(), child_id);
+                } else {
+                    let already_same = tree
+                        .child(virtual_id, name)
+                        .and_then(|cid| tree.get(cid))
+                        .map(|n| matches!(&n.kind, NodeKind::File { backing } if backing == path))
+                        .unwrap_or(false);
+                    if !already_same {
+                        warn!(
+                            name = %name,
+                            new_path = %path.display(),
+                            "duplicate file shadowed by earlier root"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build an empty directory NodeKind. Empty == trivially sorted, so
 /// `add_child` on this dir will maintain the sort invariant. Bulk-build
 /// paths (`scan_into`, `merge_into`) flip it back to unsorted with
 /// `mark_unsorted` so they can append in O(1) and we sort once at the end.
 fn empty_dir_kind() -> NodeKind {
     NodeKind::Directory {
-        by_name: HashMap::new(),
+        by_name: FastMap::default(),
         ordered: Vec::new(),
         sorted: true,
         subdir_count: 0,
@@ -205,6 +277,18 @@ fn empty_dir_kind() -> NodeKind {
 
 pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     let mut tree = Tree::new(server_id);
+
+    // Phase 1: lay out share + mount virtual nodes (sequential, RAM-only).
+    // We collect a flat job list of (target_virtual_id, physical_path,
+    // is_mount) so the disk-bound phase can fan out without touching the
+    // tree.
+    struct ScanJob {
+        target_id: NodeId,
+        physical: PathBuf,
+        is_mount: bool,
+        label: String, // for logs
+    }
+    let mut jobs: Vec<ScanJob> = Vec::new();
 
     for (share_name, share) in &config.shares {
         let share_id = tree
@@ -217,7 +301,8 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             .ok_or_else(|| anyhow::anyhow!("duplicate share name {share_name}"))?;
         info!(share = %share_name, id = share_id, "created share");
 
-        // Mounts go in first — they win over merge collisions.
+        // Mounts get virtual node first so their names take precedence over
+        // any same-named entries in merge roots.
         for (mount_name, root) in &share.mount {
             if let Some(mount_id) = tree.add_child(
                 share_id,
@@ -225,175 +310,80 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                 empty_dir_kind(),
                 CachedAttrs::synthetic_dir(),
             ) {
-                info!(share=%share_name, mount=%mount_name, root=%root.display(), "mounting");
-                scan_into(&mut tree, mount_id, root, config, 0);
+                jobs.push(ScanJob {
+                    target_id: mount_id,
+                    physical: root.clone(),
+                    is_mount: true,
+                    label: format!("{share_name}:mount:{mount_name}"),
+                });
             } else {
                 warn!(share=%share_name, mount=%mount_name, "mount name conflicts; skipping");
             }
         }
 
-        // Then merge roots union into the share root.
         for root in &share.merge {
             if !root.exists() {
                 warn!(share=%share_name, root=%root.display(), "merge root missing; skipping");
                 continue;
             }
-            info!(share=%share_name, root=%root.display(), "merging");
-            merge_into(&mut tree, share_id, root, config, 0);
+            jobs.push(ScanJob {
+                target_id: share_id,
+                physical: root.clone(),
+                is_mount: false,
+                label: format!("{share_name}:merge:{}", root.display()),
+            });
+        }
+    }
+
+    // Phase 2: snapshot every root in parallel. Each worker only needs
+    // `&Config` and the physical path; no tree access, no lock. On spinning
+    // disks this gives ≈N_disks speedup over the previous serial scan.
+    let scan_start = std::time::Instant::now();
+    let snapshots: Vec<(NodeId, PathBuf, Option<DirSnapshot>, bool, String)> =
+        std::thread::scope(|s| {
+            let cfg = config;
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|j| {
+                    s.spawn(move || {
+                        let snap = snapshot_dir(&j.physical, cfg, 0);
+                        (j.target_id, j.physical, snap, j.is_mount, j.label)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("scan worker panicked"))
+                .collect()
+        });
+    let scan_elapsed = scan_start.elapsed();
+
+    // Phase 3: apply snapshots sequentially. Mounts first (already won
+    // their share-root slot in phase 1), then merge roots in config order
+    // for first-root-wins on file conflicts.
+    let (mounts, merges): (Vec<_>, Vec<_>) =
+        snapshots.into_iter().partition(|(_, _, _, is_mount, _)| *is_mount);
+
+    for (vid, path, snap, _, label) in mounts.into_iter().chain(merges.into_iter()) {
+        match snap {
+            Some(s) => {
+                info!(target=%label, root=%path.display(), "applying scan");
+                merge_snapshot(&mut tree, vid, &s, config);
+            }
+            None => warn!(target=%label, path=%path.display(), "scan returned no data; skipping"),
         }
     }
 
     tree.finalize_sort();
-    info!(nodes = tree.node_count(), "tree built");
+    info!(
+        nodes = tree.node_count(),
+        scan_ms = scan_elapsed.as_millis() as u64,
+        "tree built"
+    );
     Ok(tree)
 }
 
-/// Walk `physical` and create a strict mirror under `virtual_id`. Used for
-/// `mount:` entries — no merging.
-fn scan_into(
-    tree: &mut Tree,
-    virtual_id: NodeId,
-    physical: &Path,
-    config: &Config,
-    depth: usize,
-) {
-    if depth > MAX_SCAN_DEPTH {
-        warn!(path=%physical.display(), "max scan depth exceeded; symlink loop?");
-        return;
-    }
-    tree.extend_dir_sources(virtual_id, physical.to_path_buf());
-    // Bulk path: append children unsorted, finalize_sort handles the rest.
-    tree.mark_unsorted(virtual_id);
-
-    let entries = match std::fs::read_dir(physical) {
-        Ok(it) => it,
-        Err(e) => {
-            warn!(path=%physical.display(), error=%e, "read_dir failed");
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let name = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => {
-                warn!(path=%entry.path().display(), "non-utf8 filename, skipping");
-                continue;
-            }
-        };
-        if config.is_hidden(&name) {
-            continue;
-        }
-        let path = entry.path();
-        let Some(md) = stat_entry(&path, config) else { continue };
-        let attrs = CachedAttrs::from_metadata(&md);
-
-        if md.is_dir() {
-            if let Some(child_id) =
-                tree.add_child(virtual_id, name.clone(), empty_dir_kind(), attrs)
-            {
-                // scan_into will register `path` as the directory's source
-                // and index it so watcher events under it match precisely.
-                scan_into(tree, child_id, &path, config, depth + 1);
-            }
-        } else if md.is_file() {
-            let kind = NodeKind::File {
-                backing: path.clone(),
-            };
-            if let Some(child_id) = tree.add_child(virtual_id, name, kind, attrs) {
-                tree.index_file(path, child_id);
-            }
-        } else {
-            // Symlink, socket, fifo, etc. — skip in v1.
-            debug!(path=%path.display(), "skipping non-regular entry");
-        }
-    }
-}
-
-/// Merge a physical root into a virtual dir. Files first-root-wins; dirs
-/// recursively merge by name.
-fn merge_into(
-    tree: &mut Tree,
-    virtual_id: NodeId,
-    physical: &Path,
-    config: &Config,
-    depth: usize,
-) {
-    if depth > MAX_SCAN_DEPTH {
-        warn!(path=%physical.display(), "max scan depth exceeded; symlink loop?");
-        return;
-    }
-    tree.extend_dir_sources(virtual_id, physical.to_path_buf());
-    tree.mark_unsorted(virtual_id);
-
-    let entries = match std::fs::read_dir(physical) {
-        Ok(it) => it,
-        Err(e) => {
-            warn!(path=%physical.display(), error=%e, "read_dir failed");
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let name = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => {
-                warn!(path=%entry.path().display(), "non-utf8 filename, skipping");
-                continue;
-            }
-        };
-        if config.is_hidden(&name) {
-            continue;
-        }
-        let path = entry.path();
-        let Some(md) = stat_entry(&path, config) else { continue };
-        let attrs = CachedAttrs::from_metadata(&md);
-
-        if md.is_dir() {
-            // If a child dir of this name already exists, descend (merge).
-            // Otherwise create a new one.
-            let existing = tree.child(virtual_id, &name);
-            let child_id = if let Some(eid) = existing {
-                // Merging into an existing dir is fine; if the existing is a
-                // file we lose to the earlier root and skip.
-                if !tree.get(eid).map(|n| n.is_dir()).unwrap_or(false) {
-                    warn!(path=%path.display(), "shadowed by earlier file with same name");
-                    continue;
-                }
-                eid
-            } else {
-                tree.add_child(virtual_id, name.clone(), empty_dir_kind(), attrs)
-                    .expect("just verified absence")
-            };
-            merge_into(tree, child_id, &path, config, depth + 1);
-        } else if md.is_file() {
-            let kind = NodeKind::File {
-                backing: path.clone(),
-            };
-            if let Some(child_id) = tree.add_child(virtual_id, name.clone(), kind, attrs) {
-                tree.index_file(path, child_id);
-            } else {
-                // Already-present-with-same-path (rescan case) is silent;
-                // genuine cross-root shadowing is logged.
-                let already_same = tree
-                    .child(virtual_id, &name)
-                    .and_then(|cid| tree.get(cid))
-                    .map(|n| matches!(&n.kind, NodeKind::File { backing } if backing == &path))
-                    .unwrap_or(false);
-                if !already_same {
-                    warn!(
-                        name = %name,
-                        new_path = %path.display(),
-                        "duplicate file shadowed by earlier root"
-                    );
-                }
-            }
-        } else {
-            debug!(path=%path.display(), "skipping non-regular entry");
-        }
-    }
-}
-
-// (Legacy single-phase `rescan_path` removed. Watcher now uses the two-phase
-// `snapshot_dir` + `apply_snapshot` pair so disk I/O happens outside the
-// tree write lock.)
+// (`scan_into` / `merge_into` removed; both replaced by `snapshot_dir` +
+// `merge_snapshot`. The single-phase `rescan_path` is also gone — the
+// watcher uses `snapshot_dir` + `apply_snapshot` so disk I/O stays outside
+// the tree write lock.)

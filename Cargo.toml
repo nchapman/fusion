@@ -18,6 +18,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
+ahash = "0.8"
+
+# jemalloc handles 1 MiB read buffers (per-RPC playback alloc) far better
+# than glibc malloc, which mmap/munmaps each. Not used on macOS where
+# system malloc is already competitive.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
 
 [profile.release]
 lto = "thin"

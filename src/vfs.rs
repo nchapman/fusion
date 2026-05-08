@@ -105,16 +105,35 @@ impl NFSFileSystem for FusionFs {
         const MAX_READ: u32 = 1 << 20;
         let count = count.min(MAX_READ);
         let want = (count as u64).min(file_len - offset) as usize;
-        let mut buf = vec![0u8; want];
-        let mut total = 0;
-        while total < buf.len() {
-            let n = file.read(&mut buf[total..]).await.map_err(|e| io_to_nfs(&e))?;
+
+        // Allocate uninitialized — we'll fill and `set_len` only after the
+        // bytes are actually written by `read`. Avoids the per-RPC zero-fill
+        // of (up to) 1 MiB during playback.
+        let mut buf: Vec<u8> = Vec::with_capacity(want);
+        let mut total = 0usize;
+        while total < want {
+            // Safety: we treat `&mut [MaybeUninit<u8>]` slice via the spare
+            // capacity, then advance `set_len` only by `n` bytes that the
+            // kernel reported it filled.
+            let spare = buf.spare_capacity_mut();
+            // tokio::io::AsyncReadExt::read takes &mut [u8]; we need to
+            // expose the uninit tail as initialized-typed bytes. Use
+            // ReadBuf via tokio's AsyncReadExt directly:
+            let dst: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    spare.as_mut_ptr() as *mut u8,
+                    spare.len(),
+                )
+            };
+            let n = file.read(dst).await.map_err(|e| io_to_nfs(&e))?;
             if n == 0 {
                 break;
             }
+            // Safety: the kernel just wrote `n` bytes into the spare
+            // capacity beginning at offset `total`.
+            unsafe { buf.set_len(total + n) };
             total += n;
         }
-        buf.truncate(total);
         let eof = offset + total as u64 >= file_len;
         Ok((buf, eof))
     }

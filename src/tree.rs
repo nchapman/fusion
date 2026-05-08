@@ -8,6 +8,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// HashMap with ahash. Names and paths hash 3–5× faster than the std SipHash
+/// default for our key sizes; not DoS-resistant, which is fine for an
+/// internal data structure (no client-controlled keys reach these maps).
+pub type FastMap<K, V> = HashMap<K, V, ahash::RandomState>;
+
 pub type NodeId = u64;
 
 pub const ROOT_ID: NodeId = 1;
@@ -38,7 +43,7 @@ impl CachedAttrs {
 pub enum NodeKind {
     Directory {
         /// Name → child id, for O(1) lookup by name.
-        by_name: HashMap<String, NodeId>,
+        by_name: FastMap<String, NodeId>,
         /// Children for stable readdir pagination. Sorted by name once the
         /// directory is finalized (`sorted == true`); during initial bulk
         /// build it's unordered to avoid O(n²) insertion.
@@ -93,7 +98,7 @@ pub struct Tree {
     /// lookups. Both file and directory paths are registered. Mutated only
     /// via `index_file` and the directory-source helpers; readers go
     /// through `lookup_path`.
-    path_index: HashMap<PathBuf, NodeId>,
+    path_index: FastMap<PathBuf, NodeId>,
     /// Stable verifier returned to clients; changes only on process restart.
     pub server_id: u64,
 }
@@ -105,7 +110,7 @@ impl Tree {
             parent: None,
             name: String::new(),
             kind: NodeKind::Directory {
-                by_name: HashMap::new(),
+                by_name: FastMap::default(),
                 ordered: Vec::new(),
                 sorted: true,
                 subdir_count: 0,
@@ -115,7 +120,7 @@ impl Tree {
         };
         Self {
             nodes: vec![None, Some(root)],
-            path_index: HashMap::new(),
+            path_index: FastMap::default(),
             server_id,
         }
     }
