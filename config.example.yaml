@@ -1,0 +1,30 @@
+server:
+  bind: 0.0.0.0:2049
+  # Bump to 11111 in development to avoid needing root for the privileged port.
+
+shares:
+  Movies:
+    # `merge` roots union into the share root. First-root-wins on filename
+    # conflicts; directories with the same name merge recursively.
+    merge:
+      - /mnt/disk1/Movies
+      - /mnt/disk2/Movies
+
+    # `mount` roots appear as named subdirectories. No merging, no conflicts.
+    # If a mount name collides with a top-level entry from a merge root,
+    # the mount wins and the collision is logged.
+    mount:
+      Archive: /mnt/archive/Movies
+      4K: /mnt/disk3/Movies-4K
+
+  TV:
+    merge:
+      - /mnt/disk1/TV
+      - /mnt/disk2/TV
+
+options:
+  hide_dotfiles: true
+  hide_patterns:
+    - ".DS_Store"
+    - "Thumbs.db"
+    - "@eaDir"

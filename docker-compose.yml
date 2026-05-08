@@ -1,0 +1,13 @@
+services:
+  fusion:
+    build: .
+    network_mode: host        # NFS+macOS-Infuse is much happier without port mapping
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/etc/fusion/config.yaml:ro
+      # Bind-mount your media roots here. Example:
+      # - /mnt/disk1:/mnt/disk1:ro
+      # - /mnt/disk2:/mnt/disk2:ro
+      # - /mnt/archive:/mnt/archive:ro
+    environment:
+      RUST_LOG: info
