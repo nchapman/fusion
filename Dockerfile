@@ -5,6 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && r
 
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
+# Cargo refuses to parse the manifest if any declared `[[bench]]` target file
+# is missing — even for `cargo build` which doesn't compile benches.
+COPY benches ./benches
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release && \
