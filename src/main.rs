@@ -29,7 +29,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -53,11 +55,7 @@ async fn main() -> Result<()> {
 
     let bind = config.server.bind.clone();
     info!(%bind, "starting NFS server");
-    let listener = NFSTcpListener::bind(
-        &bind,
-        FusionFs::new(tree, server_id, file_cache),
-    )
-    .await?;
+    let listener = NFSTcpListener::bind(&bind, FusionFs::new(tree, server_id, file_cache)).await?;
     listener.handle_forever().await?;
     Ok(())
 }

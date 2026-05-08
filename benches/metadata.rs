@@ -22,7 +22,9 @@ fn fs_with_n_files(n: usize) -> (FusionFs, Vec<String>) {
         tree.add_child(
             ROOT_ID,
             name.clone(),
-            NodeKind::File { backing: PathBuf::from("/dev/null") },
+            NodeKind::File {
+                backing: PathBuf::from("/dev/null"),
+            },
             CachedAttrs::synthetic_file(0),
         )
         .unwrap();

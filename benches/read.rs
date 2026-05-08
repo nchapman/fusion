@@ -23,7 +23,10 @@ const READ_SIZE: u32 = 1024 * 1024; // 1 MiB — Infuse playback chunk size
 fn write_random(path: &Path, len: usize) {
     let mut buf = vec![0u8; len];
     rand::thread_rng().fill_bytes(&mut buf);
-    std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+    std::fs::File::create(path)
+        .unwrap()
+        .write_all(&buf)
+        .unwrap();
 }
 
 fn fs_with_one_file(td: &TempDir) -> (FusionFs, FileCache, u64) {

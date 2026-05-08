@@ -50,10 +50,7 @@ fn cfg_for(roots: Vec<PathBuf>) -> Config {
 fn bench_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("build");
     // (label, dirs, files_per_dir) — total file count = dirs * files_per_dir.
-    for &(label, dirs, files) in &[
-        ("small_200", 20, 10),
-        ("medium_5000", 100, 50),
-    ] {
+    for &(label, dirs, files) in &[("small_200", 20, 10), ("medium_5000", 100, 50)] {
         let td = make_tree(dirs, files);
         let cfg = cfg_for(vec![td.path().to_path_buf()]);
         let total_files = (dirs * files) as u64;
