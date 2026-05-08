@@ -7,7 +7,7 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::tree::{CachedAttrs, DirSources, FastMap, NodeKind, NodeId, Tree, ROOT_ID};
+use crate::tree::{CachedAttrs, DirSources, NodeKind, NodeId, Tree, ROOT_ID};
 
 /// Cap on recursive descent during scans. Protects against symlink loops
 /// when `follow_symlinks` is enabled.
@@ -173,7 +173,7 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 if let Some(child_id) = tree.add_child(
                     virtual_id,
                     name.clone(),
-                    empty_dir_kind(),
+                    NodeKind::empty_dir(),
                     sub.attrs.clone(),
                 ) {
                     apply_snapshot(tree, child_id, sub);
@@ -217,7 +217,7 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                     match tree.add_child(
                         virtual_id,
                         name.clone(),
-                        empty_dir_kind(),
+                        NodeKind::empty_dir(),
                         sub.attrs.clone(),
                     ) {
                         Some(id) => id,
@@ -251,20 +251,6 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
     }
 }
 
-/// Build an empty directory NodeKind. Empty == trivially sorted, so
-/// `add_child` on this dir will maintain the sort invariant. Bulk-build
-/// paths (`scan_into`, `merge_into`) flip it back to unsorted with
-/// `mark_unsorted` so they can append in O(1) and we sort once at the end.
-fn empty_dir_kind() -> NodeKind {
-    NodeKind::Directory {
-        by_name: FastMap::default(),
-        ordered: Vec::new(),
-        sorted: true,
-        subdir_count: 0,
-        sources: DirSources::Synthetic,
-    }
-}
-
 pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     let mut tree = Tree::new(server_id);
 
@@ -290,7 +276,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             .add_child(
                 ROOT_ID,
                 share_name.clone(),
-                empty_dir_kind(),
+                NodeKind::empty_dir(),
                 CachedAttrs::synthetic_dir(),
             )
             .ok_or_else(|| anyhow::anyhow!("duplicate share name {share_name}"))?;
@@ -302,7 +288,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             if let Some(mount_id) = tree.add_child(
                 share_id,
                 mount_name.clone(),
-                empty_dir_kind(),
+                NodeKind::empty_dir(),
                 CachedAttrs::synthetic_dir(),
             ) {
                 jobs.push(ScanJob {
@@ -555,13 +541,7 @@ mod tests {
             .add_child(
                 ROOT_ID,
                 "Movies".into(),
-                NodeKind::Directory {
-                    by_name: FastMap::default(),
-                    ordered: Vec::new(),
-                    sorted: true,
-                    subdir_count: 0,
-                    sources: DirSources::Synthetic,
-                },
+                NodeKind::empty_dir(),
                 CachedAttrs::synthetic_dir(),
             )
             .unwrap();
@@ -593,13 +573,7 @@ mod tests {
             .add_child(
                 ROOT_ID,
                 "TV".into(),
-                NodeKind::Directory {
-                    by_name: FastMap::default(),
-                    ordered: Vec::new(),
-                    sorted: true,
-                    subdir_count: 0,
-                    sources: DirSources::Synthetic,
-                },
+                NodeKind::empty_dir(),
                 CachedAttrs::synthetic_dir(),
             )
             .unwrap();
@@ -630,13 +604,7 @@ mod tests {
             .add_child(
                 ROOT_ID,
                 "Movies".into(),
-                NodeKind::Directory {
-                    by_name: FastMap::default(),
-                    ordered: Vec::new(),
-                    sorted: true,
-                    subdir_count: 0,
-                    sources: DirSources::Synthetic,
-                },
+                NodeKind::empty_dir(),
                 CachedAttrs::synthetic_dir(),
             )
             .unwrap();

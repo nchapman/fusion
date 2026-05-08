@@ -37,6 +37,17 @@ impl CachedAttrs {
             mode: 0o555,
         }
     }
+
+    pub fn synthetic_file(size: u64) -> Self {
+        let now = SystemTime::now();
+        Self {
+            size,
+            mtime: now,
+            ctime: now,
+            atime: now,
+            mode: 0o444,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -69,6 +80,21 @@ pub enum DirSources {
     Synthetic,
     /// One or more physical directories that union into this virtual dir.
     Physical(Vec<PathBuf>),
+}
+
+impl NodeKind {
+    /// Empty directory with `Synthetic` sources and `sorted=true` invariant.
+    /// Bulk-build paths flip `sorted` to false via `mark_unsorted` so they
+    /// can append in O(1) and sort once at the end.
+    pub fn empty_dir() -> Self {
+        Self::Directory {
+            by_name: FastMap::default(),
+            ordered: Vec::new(),
+            sorted: true,
+            subdir_count: 0,
+            sources: DirSources::Synthetic,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -385,16 +411,6 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn empty_dir() -> NodeKind {
-        NodeKind::Directory {
-            by_name: FastMap::default(),
-            ordered: Vec::new(),
-            sorted: true,
-            subdir_count: 0,
-            sources: DirSources::Synthetic,
-        }
-    }
-
     fn file_kind(path: &str) -> NodeKind {
         NodeKind::File { backing: PathBuf::from(path) }
     }
@@ -437,7 +453,7 @@ mod tests {
     fn add_child_inserts_and_indexes_by_name() {
         let mut tree = Tree::new(0);
         let id = tree
-            .add_child(ROOT_ID, "Movies".into(), empty_dir(), dir_attrs())
+            .add_child(ROOT_ID, "Movies".into(), NodeKind::empty_dir(), dir_attrs())
             .expect("inserted");
         assert_eq!(tree.child(ROOT_ID, "Movies"), Some(id));
         assert_eq!(ordered_names(&tree, ROOT_ID), vec!["Movies".to_string()]);
@@ -447,10 +463,10 @@ mod tests {
     fn add_child_returns_none_on_name_collision() {
         let mut tree = Tree::new(0);
         let first = tree
-            .add_child(ROOT_ID, "dup".into(), empty_dir(), dir_attrs())
+            .add_child(ROOT_ID, "dup".into(), NodeKind::empty_dir(), dir_attrs())
             .expect("inserted");
         let next_id_before = tree.nodes.len() as NodeId;
-        let collision = tree.add_child(ROOT_ID, "dup".into(), empty_dir(), dir_attrs());
+        let collision = tree.add_child(ROOT_ID, "dup".into(), NodeKind::empty_dir(), dir_attrs());
         assert_eq!(collision, None);
         // Failed insert must not consume an id slot.
         assert_eq!(tree.nodes.len() as NodeId, next_id_before);
@@ -460,8 +476,8 @@ mod tests {
     #[test]
     fn subdir_count_tracks_directories_only() {
         let mut tree = Tree::new(0);
-        tree.add_child(ROOT_ID, "a".into(), empty_dir(), dir_attrs()).unwrap();
-        tree.add_child(ROOT_ID, "b".into(), empty_dir(), dir_attrs()).unwrap();
+        tree.add_child(ROOT_ID, "a".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
+        tree.add_child(ROOT_ID, "b".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         tree.add_child(ROOT_ID, "f.txt".into(), file_kind("/x/f.txt"), dir_attrs())
             .unwrap();
         assert_eq!(subdir_count(&tree, ROOT_ID), 2);
@@ -470,8 +486,8 @@ mod tests {
     #[test]
     fn remove_recursive_decrements_subdir_count() {
         let mut tree = Tree::new(0);
-        let a = tree.add_child(ROOT_ID, "a".into(), empty_dir(), dir_attrs()).unwrap();
-        tree.add_child(ROOT_ID, "b".into(), empty_dir(), dir_attrs()).unwrap();
+        let a = tree.add_child(ROOT_ID, "a".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
+        tree.add_child(ROOT_ID, "b".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         assert_eq!(subdir_count(&tree, ROOT_ID), 2);
         tree.remove_recursive(a);
         assert_eq!(subdir_count(&tree, ROOT_ID), 1);
@@ -481,14 +497,14 @@ mod tests {
     #[test]
     fn remove_recursive_does_not_recycle_node_ids() {
         let mut tree = Tree::new(0);
-        let a = tree.add_child(ROOT_ID, "a".into(), empty_dir(), dir_attrs()).unwrap();
+        let a = tree.add_child(ROOT_ID, "a".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         let len_before = tree.nodes.len();
         tree.remove_recursive(a);
         // Slot for `a` is now None but the Vec is unchanged in length —
         // ids must remain stable for the process lifetime.
         assert_eq!(tree.nodes.len(), len_before);
         assert!(tree.nodes[a as usize].is_none());
-        let b = tree.add_child(ROOT_ID, "b".into(), empty_dir(), dir_attrs()).unwrap();
+        let b = tree.add_child(ROOT_ID, "b".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         assert_ne!(a, b, "ids must not be recycled");
         assert!(b > a);
     }
@@ -496,7 +512,7 @@ mod tests {
     #[test]
     fn remove_recursive_clears_path_index_for_files() {
         let mut tree = Tree::new(0);
-        let dir = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let dir = tree.add_child(ROOT_ID, "d".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         let file = tree
             .add_child(dir, "f".into(), file_kind("/disk/f"), dir_attrs())
             .unwrap();
@@ -517,10 +533,10 @@ mod tests {
     #[test]
     fn finalize_sort_sorts_unsorted_dirs() {
         let mut tree = Tree::new(0);
-        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let d = tree.add_child(ROOT_ID, "d".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         tree.mark_unsorted(d);
         for n in ["c", "a", "b"] {
-            tree.add_child(d, n.into(), empty_dir(), dir_attrs()).unwrap();
+            tree.add_child(d, n.into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         }
         // Before finalize, `sorted=false` so order reflects insertion.
         assert_eq!(ordered_names(&tree, d), vec!["c", "a", "b"]);
@@ -531,10 +547,10 @@ mod tests {
     #[test]
     fn add_child_into_sorted_dir_inserts_in_order() {
         let mut tree = Tree::new(0);
-        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let d = tree.add_child(ROOT_ID, "d".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         // Default is sorted=true, so each insert must binary-search into place.
         for n in ["c", "a", "b"] {
-            tree.add_child(d, n.into(), empty_dir(), dir_attrs()).unwrap();
+            tree.add_child(d, n.into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         }
         assert_eq!(ordered_names(&tree, d), vec!["a", "b", "c"]);
     }
@@ -542,7 +558,7 @@ mod tests {
     #[test]
     fn drop_dir_source_signals_emptiness_and_clears_path_index() {
         let mut tree = Tree::new(0);
-        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let d = tree.add_child(ROOT_ID, "d".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         let p1 = PathBuf::from("/m1/d");
         let p2 = PathBuf::from("/m2/d");
         tree.extend_dir_sources(d, p1.clone());
@@ -557,7 +573,7 @@ mod tests {
     #[test]
     fn extend_dir_sources_promotes_synthetic_to_physical() {
         let mut tree = Tree::new(0);
-        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let d = tree.add_child(ROOT_ID, "d".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         tree.extend_dir_sources(d, PathBuf::from("/m/d"));
         match &tree.get(d).unwrap().kind {
             NodeKind::Directory { sources: DirSources::Physical(v), .. } => {
@@ -570,7 +586,7 @@ mod tests {
     #[test]
     fn add_and_remove_bump_parent_mtime() {
         let mut tree = Tree::new(0);
-        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let d = tree.add_child(ROOT_ID, "d".into(), NodeKind::empty_dir(), dir_attrs()).unwrap();
         let mtime0 = tree.get(d).unwrap().attrs.mtime;
         std::thread::sleep(std::time::Duration::from_millis(2));
         let f = tree.add_child(d, "f".into(), file_kind("/x"), dir_attrs()).unwrap();

@@ -1,10 +1,3 @@
-mod attrs;
-mod builder;
-mod config;
-mod tree;
-mod vfs;
-mod watcher;
-
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -20,9 +13,10 @@ use tokio::sync::RwLock;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-use crate::vfs::{new_file_cache, FusionFs};
-use crate::watcher::Watcher;
+use fusion::builder;
+use fusion::config::Config;
+use fusion::vfs::{new_file_cache, FusionFs};
+use fusion::watcher::{self, Watcher};
 
 #[derive(Parser)]
 #[command(name = "fusion", about = "Read-only virtual NFS for media libraries")]

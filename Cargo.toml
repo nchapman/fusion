@@ -30,6 +30,19 @@ tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "build"
+harness = false
+
+[[bench]]
+name = "metadata"
+harness = false
+
+[[bench]]
+name = "read"
+harness = false
 
 [profile.release]
 lto = "thin"

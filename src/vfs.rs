@@ -347,20 +347,10 @@ fn _types(_a: ftype3, _b: nfstime3, _c: specdata3) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::{CachedAttrs, DirSources, FastMap, NodeKind, Tree};
+    use crate::tree::{CachedAttrs, NodeKind, Tree};
     use nfsserve::nfs::ftype3;
     use std::io::Write;
     use std::path::PathBuf;
-
-    fn empty_dir_kind() -> NodeKind {
-        NodeKind::Directory {
-            by_name: FastMap::default(),
-            ordered: Vec::new(),
-            sorted: true,
-            subdir_count: 0,
-            sources: DirSources::Synthetic,
-        }
-    }
 
     fn fs_with(tree: Tree) -> FusionFs {
         let server_id = tree.server_id;
@@ -387,7 +377,7 @@ mod tests {
     async fn lookup_dot_and_dotdot() {
         let mut tree = Tree::new(0);
         let child = tree
-            .add_child(ROOT_ID, "sub".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .add_child(ROOT_ID, "sub".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
             .unwrap();
         let fs = fs_with(tree);
 
@@ -415,10 +405,10 @@ mod tests {
     async fn getattr_dir_nlink_is_two_plus_subdirs() {
         let mut tree = Tree::new(0);
         let parent = tree
-            .add_child(ROOT_ID, "p".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .add_child(ROOT_ID, "p".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
             .unwrap();
         for n in ["a", "b", "c"] {
-            tree.add_child(parent, n.into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            tree.add_child(parent, n.into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
                 .unwrap();
         }
         // Add a file too — must NOT count toward nlink.
@@ -458,7 +448,7 @@ mod tests {
         let mut ids = Vec::new();
         for n in ["a", "b", "c", "d"] {
             ids.push(
-                tree.add_child(ROOT_ID, n.into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+                tree.add_child(ROOT_ID, n.into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
                     .unwrap(),
             );
         }
@@ -478,9 +468,9 @@ mod tests {
     async fn readdir_returns_bad_cookie_for_stale_start_after() {
         let mut tree = Tree::new(0);
         let a = tree
-            .add_child(ROOT_ID, "a".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .add_child(ROOT_ID, "a".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
             .unwrap();
-        tree.add_child(ROOT_ID, "b".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+        tree.add_child(ROOT_ID, "b".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
             .unwrap();
         // Delete `a`. Its NodeId is now stale as a cookie.
         tree.remove_recursive(a);
