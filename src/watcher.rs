@@ -436,6 +436,7 @@ mod tests {
             ShareConfig {
                 merge: vec![root.to_path_buf()],
                 subdirs: BTreeMap::new(),
+                dedupe_depth: None,
             },
         );
         m
@@ -462,6 +463,7 @@ mod tests {
                     m.insert("Archive".to_string(), archive.path().to_path_buf());
                     m
                 },
+                dedupe_depth: None,
             },
         );
         let cfg = cfg_with(shares);

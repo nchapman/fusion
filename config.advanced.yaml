@@ -29,6 +29,21 @@ shares:
       Archive: /mnt/archive/Movies
       4K: /mnt/disk3/Movies-4K
 
+    # `dedupe_depth` (optional) stops the recursive folder union at a fixed
+    # depth: at depth N, a folder name first claimed by an earlier merge root
+    # shadows later roots' copies of that folder entirely (subtree and all),
+    # rather than merging contents. Useful when the same logical item exists
+    # in multiple roots — e.g. resolution tiers — and you want one tier to
+    # win cleanly instead of interleaving.
+    #
+    # Examples:
+    #   dedupe_depth: 1  # per-movie folders ("Inception (2010)" wins from
+    #                    # the first root listed; same-named folders in
+    #                    # later roots are dropped)
+    #   dedupe_depth: 2  # one level deeper (e.g. seasons inside shows)
+    # Omit (default) to fully union directory trees.
+    # dedupe_depth: 1
+
   TV:
     merge:
       - /mnt/disk1/TV

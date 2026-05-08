@@ -48,6 +48,7 @@ fn cfg() -> Config {
         ShareConfig {
             merge: vec![PathBuf::from("/unused")],
             subdirs: BTreeMap::new(),
+            dedupe_depth: None,
         },
     );
     Config::from_parts(ServerConfig::default(), shares, Options::default()).expect("bench config")
@@ -97,7 +98,7 @@ fn setup() -> BenchSetup {
         )
         .unwrap();
     for snap in &snapshots {
-        merge_snapshot(&mut tree, share, snap);
+        merge_snapshot(&mut tree, share, snap, None);
     }
     tree.finalize_sort();
 

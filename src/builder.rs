@@ -251,11 +251,22 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
 /// semantics. Used during initial build, where multiple `merge:` roots feed
 /// the same virtual share and conflicts are resolved by config order.
 ///
-/// Dir-name collision: if a dir of this name already exists, descend into
-/// it (recursive merge of subtrees). File-name collision: keep the existing
-/// (earlier) entry; log a warning unless the existing's backing is the same
-/// path (which means we're re-applying our own work).
-pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
+/// `dedupe_depth` controls folder-level shadowing: `None` recurses forever
+/// (fully union directory trees). `Some(0)` shadows colliding directories at
+/// the *current* level — an earlier root's directory wins entirely and the
+/// incoming subtree is dropped. The depth decrements on each recursion.
+///
+/// Dir-name collision below dedupe depth: if a dir of this name already
+/// exists, descend into it (recursive merge of subtrees). File-name
+/// collision: keep the existing (earlier) entry; log a warning unless the
+/// existing's backing is the same path (which means we're re-applying our
+/// own work).
+pub fn merge_snapshot(
+    tree: &mut Tree,
+    virtual_id: NodeId,
+    snap: &DirSnapshot,
+    dedupe_depth: Option<usize>,
+) {
     tree.extend_dir_sources(virtual_id, snap.physical.clone());
     tree.mark_unsorted(virtual_id);
 
@@ -270,6 +281,17 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                         warn!(name=%name, "incoming directory shadowed by earlier file with same name");
                         continue;
                     }
+                    if dedupe_depth == Some(0) {
+                        // Folder-level dedupe: an earlier root already owns
+                        // this directory name. Drop the incoming subtree
+                        // entirely instead of merging.
+                        warn!(
+                            name = %name,
+                            losing_root = %sub.physical.display(),
+                            "directory shadowed by earlier root (dedupe_depth)"
+                        );
+                        continue;
+                    }
                     eid
                 } else {
                     match tree.add_child(
@@ -282,7 +304,12 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                         None => continue,
                     }
                 };
-                merge_snapshot(tree, child_id, sub);
+                merge_snapshot(
+                    tree,
+                    child_id,
+                    sub,
+                    dedupe_depth.map(|d| d.saturating_sub(1)),
+                );
             }
             EntrySnapshot::File { path, attrs } => {
                 let kind = NodeKind::File {
@@ -323,6 +350,15 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
         physical: PathBuf,
         is_subdir: bool,
         label: String, // for logs
+        // Internal dedupe counter passed to `merge_snapshot`. The invariant:
+        // when `merge_snapshot` is called with `Some(0)`, dir-collisions in
+        // the *current call's child loop* are deduped; recursion into a
+        // surviving child decrements (saturating). User-facing
+        // `dedupe_depth = N` therefore enters as `Some(N - 1)`: at depth=1
+        // the top-level child loop dedupes immediately; at depth=2 we
+        // recurse once before the trigger fires. `None` disables dedupe.
+        // Subdirs always get `None` — dedupe is a merge-roots concept.
+        dedupe_remaining: Option<usize>,
     }
     let mut jobs: Vec<ScanJob> = Vec::new();
     // Per-share subdir names. The doc'd contract is that a subdir shadows any
@@ -356,6 +392,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                     physical: root.clone(),
                     is_subdir: true,
                     label: format!("{share_name}:subdir:{subdir_name}"),
+                    dedupe_remaining: None,
                 });
                 subdir_names_per_share
                     .entry(share_id)
@@ -376,6 +413,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                 physical: root.clone(),
                 is_subdir: false,
                 label: format!("{share_name}:merge:{}", root.display()),
+                dedupe_remaining: share.dedupe_depth.map(|d| d.saturating_sub(1)),
             });
         }
     }
@@ -389,6 +427,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
         snapshot: Option<DirSnapshot>,
         is_subdir: bool,
         label: String,
+        dedupe_remaining: Option<usize>,
     }
     let scan_start = std::time::Instant::now();
     let snapshots: Vec<ScanResult> = std::thread::scope(|s| {
@@ -402,9 +441,14 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                     physical: j.physical,
                     is_subdir: j.is_subdir,
                     label: j.label,
+                    dedupe_remaining: j.dedupe_remaining,
                 })
             })
             .collect();
+        // Joining handles in spawn order (i.e. config order) — threads may
+        // *complete* in any order, but `snapshots[i]` corresponds to
+        // `jobs[i]`, which is what first-root-wins / dedupe semantics
+        // depend on at apply time.
         handles
             .into_iter()
             .map(|h| h.join().expect("scan worker panicked"))
@@ -424,6 +468,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             snapshot,
             is_subdir,
             label,
+            dedupe_remaining,
         } = r;
         match snapshot {
             Some(mut s) => {
@@ -444,7 +489,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                     }
                 }
                 info!(target=%label, root=%physical.display(), "applying scan");
-                merge_snapshot(&mut tree, target_id, &s);
+                merge_snapshot(&mut tree, target_id, &s, dedupe_remaining);
             }
             None => {
                 warn!(target=%label, path=%physical.display(), "scan returned no data; skipping")
@@ -613,8 +658,8 @@ mod tests {
 
         let s1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
         let s2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &s1);
-        merge_snapshot(&mut tree, share, &s2);
+        merge_snapshot(&mut tree, share, &s1, None);
+        merge_snapshot(&mut tree, share, &s2, None);
         tree.finalize_sort();
 
         let backing = file_backing(&tree, share, "Movie.mkv");
@@ -623,6 +668,116 @@ mod tests {
             "first root must win: backing={}",
             backing.display()
         );
+    }
+
+    #[test]
+    fn merge_snapshot_dedupe_depth_one_drops_colliding_top_level_dir() {
+        // The headline case: two roots both contain `Inception (2010)/...`.
+        // With dedupe_depth=1 (internally Some(0) at top level), the second
+        // root's copy of the folder must be dropped entirely — none of its
+        // files should leak into the first root's folder.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Inception (2010)/r1.mkv"));
+        touch(&r1.path().join("Inception (2010)/extras/r1-extra.mkv"));
+        touch(&r2.path().join("Inception (2010)/r2.mkv"));
+        touch(&r2.path().join("Inception (2010)/extras/r2-extra.mkv"));
+        touch(&r2.path().join("OnlyInR2/file.mkv"));
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "Movies".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+
+        let s1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
+        let s2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
+        // dedupe_depth=1 (user-facing) → Some(0) internally.
+        merge_snapshot(&mut tree, share, &s1, Some(0));
+        merge_snapshot(&mut tree, share, &s2, Some(0));
+        tree.finalize_sort();
+
+        // The deduped folder is fully owned by r1 — no r2 leakage anywhere.
+        let movie = tree.child(share, "Inception (2010)").expect("present");
+        let mut top = child_names(&tree, movie);
+        top.sort();
+        assert_eq!(
+            top,
+            vec!["extras".to_string(), "r1.mkv".to_string()],
+            "top-level contents of deduped folder should come from r1 only"
+        );
+        let extras = tree.child(movie, "extras").unwrap();
+        assert_eq!(
+            child_names(&tree, extras),
+            vec!["r1-extra.mkv".to_string()],
+            "subtree of deduped folder must come from r1 only"
+        );
+
+        // Names not present in r1 are still added by r2 (dedupe doesn't
+        // mean r2 contributes nothing — it just can't shadow-merge).
+        assert!(tree.child(share, "OnlyInR2").is_some());
+    }
+
+    #[test]
+    fn merge_snapshot_dedupe_depth_two_dedupes_one_level_deeper() {
+        // dedupe_depth=2: top-level folders merge normally; the *second*
+        // level (e.g. seasons inside a show) is deduped. Tests that the
+        // depth counter actually decrements on recursion.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Show/Season 1/r1-ep1.mkv"));
+        touch(&r2.path().join("Show/Season 1/r2-ep2.mkv")); // shadowed
+        touch(&r2.path().join("Show/Season 2/r2-ep1.mkv")); // not shadowed (new)
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "TV".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+
+        // dedupe_depth=2 (user-facing) → Some(1) internally.
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
+            Some(1),
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
+            Some(1),
+        );
+        tree.finalize_sort();
+
+        let show = tree.child(share, "Show").expect("Show merged");
+        let mut seasons = child_names(&tree, show);
+        seasons.sort();
+        assert_eq!(
+            seasons,
+            vec!["Season 1".to_string(), "Season 2".to_string()],
+            "Show should union both roots' season folders"
+        );
+        // Season 1 is shadowed by r1: only r1's episode is present.
+        let s1 = tree.child(show, "Season 1").unwrap();
+        assert_eq!(
+            child_names(&tree, s1),
+            vec!["r1-ep1.mkv".to_string()],
+            "Season 1 contents must come from r1 only (depth-2 dedupe)"
+        );
+        // Season 2 was added by r2 (no collision).
+        let s2 = tree.child(show, "Season 2").unwrap();
+        assert_eq!(child_names(&tree, s2), vec!["r2-ep1.mkv".to_string()]);
     }
 
     #[test]
@@ -645,8 +800,8 @@ mod tests {
 
         let s1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
         let s2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &s1);
-        merge_snapshot(&mut tree, share, &s2);
+        merge_snapshot(&mut tree, share, &s1, None);
+        merge_snapshot(&mut tree, share, &s2, None);
         tree.finalize_sort();
 
         let show = tree.child(share, "Show").expect("Show present");
@@ -674,7 +829,7 @@ mod tests {
             )
             .unwrap();
         let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &snap1);
+        merge_snapshot(&mut tree, share, &snap1, None);
         tree.finalize_sort();
         assert!(tree.child(share, "gone.mkv").is_some());
 
@@ -709,7 +864,7 @@ mod tests {
             )
             .unwrap();
         let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &snap1);
+        merge_snapshot(&mut tree, share, &snap1, None);
         tree.finalize_sort();
 
         // Backdate parent mtime to a sentinel; if apply_snapshot's
@@ -749,6 +904,7 @@ mod tests {
                     m.insert("Archive".to_string(), archive.path().to_path_buf());
                     m
                 },
+                dedupe_depth: None,
             },
         );
         let cfg = cfg_for(shares);
@@ -787,6 +943,7 @@ mod tests {
                     m.insert("Archive".to_string(), subdir_root.path().to_path_buf());
                     m
                 },
+                dedupe_depth: None,
             },
         );
         let cfg = cfg_for(shares);
@@ -821,7 +978,7 @@ mod tests {
             )
             .unwrap();
         let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &snap1);
+        merge_snapshot(&mut tree, share, &snap1, None);
         tree.finalize_sort();
 
         // Add three files that interleave alphabetically with the existing
@@ -865,7 +1022,7 @@ mod tests {
             )
             .unwrap();
         let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &snap1);
+        merge_snapshot(&mut tree, share, &snap1, None);
         tree.finalize_sort();
 
         std::fs::remove_file(&entry).unwrap();
@@ -881,6 +1038,57 @@ mod tests {
             "entry must now be a dir"
         );
         assert!(tree.child(entry_id, "inner.txt").is_some());
+    }
+
+    #[test]
+    fn apply_snapshot_does_not_leak_into_dir_owned_by_another_root() {
+        // Sets up a deduped initial build then rescans the losing root.
+        // The protection that keeps r2's contents out of r1's deduped folder
+        // is *not* dedupe-specific — it's `apply_snapshot`'s generic
+        // source-ownership check (the dir's `sources` only lists r1's path,
+        // so r2's snapshot is `!backed_here` and skipped). The dir-level
+        // analogue of `apply_snapshot_does_not_remove_files_from_other_merge_roots`.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Inception (2010)/r1.mkv"));
+        touch(&r2.path().join("Inception (2010)/r2.mkv"));
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "Movies".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
+            Some(0),
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
+            Some(0),
+        );
+        tree.finalize_sort();
+
+        // Now simulate a watcher event on r2: a new file appears inside the
+        // shadowed folder, and r2's full root is rescanned.
+        touch(&r2.path().join("Inception (2010)/late-arrival.mkv"));
+        let snap_r2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap_r2);
+
+        let movie = tree.child(share, "Inception (2010)").unwrap();
+        assert_eq!(
+            child_names(&tree, movie),
+            vec!["r1.mkv".to_string()],
+            "rescan of losing root must not leak files into deduped folder"
+        );
     }
 
     #[test]
@@ -904,7 +1112,7 @@ mod tests {
             )
             .unwrap();
         let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        merge_snapshot(&mut tree, share, &snap1);
+        merge_snapshot(&mut tree, share, &snap1, None);
         tree.finalize_sort();
 
         std::fs::remove_dir_all(&entry).unwrap();
@@ -944,8 +1152,18 @@ mod tests {
                 CachedAttrs::synthetic_dir(),
             )
             .unwrap();
-        merge_snapshot(&mut tree, share, &snapshot_dir(r1.path(), &cfg, 0).unwrap());
-        merge_snapshot(&mut tree, share, &snapshot_dir(r2.path(), &cfg, 0).unwrap());
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
+            None,
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
+            None,
+        );
         tree.finalize_sort();
         assert!(tree.child(share, "from_r2.mkv").is_some());
 
@@ -966,6 +1184,131 @@ mod tests {
     }
 
     #[test]
+    fn build_with_dedupe_depth_drops_colliding_top_level_dir() {
+        // End-to-end: dedupe_depth in ShareConfig is wired through `build()`
+        // (the `dedupe_depth.saturating_sub(1)` translation at the call site)
+        // so user-facing depth=1 actually shadows top-level folders.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Inception (2010)/r1.mkv"));
+        touch(&r2.path().join("Inception (2010)/r2.mkv"));
+        touch(&r2.path().join("Tenet (2020)/r2.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Movies".to_string(),
+            ShareConfig {
+                merge: vec![r1.path().to_path_buf(), r2.path().to_path_buf()],
+                subdirs: BTreeMap::new(),
+                dedupe_depth: Some(1),
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let movies = tree.child(ROOT_ID, "Movies").unwrap();
+        let inception = tree.child(movies, "Inception (2010)").unwrap();
+        // r1 wins entirely — only r1.mkv inside.
+        assert_eq!(
+            child_names(&tree, inception),
+            vec!["r1.mkv".to_string()],
+            "deduped folder must not contain r2 contents"
+        );
+        // r2's unique movie is still added.
+        assert!(tree.child(movies, "Tenet (2020)").is_some());
+    }
+
+    #[test]
+    fn build_with_dedupe_depth_two_dedupes_one_level_deeper() {
+        // End-to-end check that the build()-site `saturating_sub(1)`
+        // translation works for a non-trivial depth (catches regressions
+        // where someone "fixes" the off-by-one and shifts everyone's
+        // semantics by 1).
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Show/Season 1/r1-ep1.mkv"));
+        touch(&r2.path().join("Show/Season 1/r2-ep2.mkv")); // shadowed
+        touch(&r2.path().join("Show/Season 2/r2-ep1.mkv")); // unique, kept
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "TV".to_string(),
+            ShareConfig {
+                merge: vec![r1.path().to_path_buf(), r2.path().to_path_buf()],
+                subdirs: BTreeMap::new(),
+                dedupe_depth: Some(2),
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let tv = tree.child(ROOT_ID, "TV").unwrap();
+        let show = tree.child(tv, "Show").unwrap();
+        let s1 = tree.child(show, "Season 1").unwrap();
+        assert_eq!(
+            child_names(&tree, s1),
+            vec!["r1-ep1.mkv".to_string()],
+            "depth=2 must dedupe Season 1 (r1 wins, r2 dropped)"
+        );
+        // Season 2 only exists in r2 → still added.
+        assert!(tree.child(show, "Season 2").is_some());
+    }
+
+    #[test]
+    fn apply_snapshot_winner_deletion_promotes_loser_on_next_rescan() {
+        // Documented behavior: dedupe is enforced at build time, not
+        // persistently. If the winning root's deduped folder is later
+        // deleted, the next watcher rescan that re-adds the folder from
+        // a losing root will succeed. This test pins down the behavior
+        // so a future change can't silently shift it.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Inception (2010)/r1.mkv"));
+        touch(&r2.path().join("Inception (2010)/r2.mkv"));
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "Movies".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
+            Some(0),
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
+            Some(0),
+        );
+        tree.finalize_sort();
+
+        // r1 deletes its copy of Inception entirely.
+        std::fs::remove_dir_all(r1.path().join("Inception (2010)")).unwrap();
+        // Watcher rescan of r1: snapshot has no "Inception (2010)" entry,
+        // so apply_snapshot drops the source; since r1 was the only source,
+        // the virtual node is removed.
+        apply_snapshot(&mut tree, share, &snapshot_dir(r1.path(), &cfg, 0).unwrap());
+        // Then watcher rescan of r2: now there's no virtual dir at this
+        // name, so r2's copy is added fresh.
+        apply_snapshot(&mut tree, share, &snapshot_dir(r2.path(), &cfg, 0).unwrap());
+
+        let movie = tree
+            .child(share, "Inception (2010)")
+            .expect("loser root should be promoted after winner's copy is removed");
+        assert_eq!(
+            child_names(&tree, movie),
+            vec!["r2.mkv".to_string()],
+            "after winner deletion, loser's contents should be visible"
+        );
+    }
+
+    #[test]
     fn build_skips_missing_merge_root_with_warning() {
         let real = TempDir::new().unwrap();
         touch(&real.path().join("real.mkv"));
@@ -978,6 +1321,7 @@ mod tests {
                     PathBuf::from("/definitely/not/here"),
                 ],
                 subdirs: BTreeMap::new(),
+                dedupe_depth: None,
             },
         );
         let cfg = cfg_for(shares);

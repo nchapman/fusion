@@ -38,6 +38,7 @@ fn cfg_for(roots: Vec<PathBuf>) -> Config {
         ShareConfig {
             merge: roots,
             subdirs: BTreeMap::new(),
+            dedupe_depth: None,
         },
     );
     Config::from_parts(ServerConfig::default(), shares, Options::default()).expect("bench config")

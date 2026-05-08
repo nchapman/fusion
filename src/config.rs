@@ -48,6 +48,24 @@ pub struct ShareConfig {
     pub merge: Vec<PathBuf>,
     /// Roots that appear as named subdirectories of the share.
     pub subdirs: BTreeMap<String, PathBuf>,
+    /// Folder-level dedupe depth for `merge` roots. `None` (default) recurses
+    /// forever so directory trees fully union. `Some(N)` stops merging at
+    /// depth N: a directory whose name was first claimed by an earlier root
+    /// shadows later roots' copy of that directory entirely (subtree and all),
+    /// matching the existing first-root-wins file-collision rule. Useful when
+    /// the same logical item exists in multiple roots (e.g. resolution tiers)
+    /// and recursive union would interleave their contents.
+    ///
+    /// Caveat: dedupe is enforced at *build time* (initial scan + full
+    /// rescans), not in incremental watcher applies. If the winning root's
+    /// copy of a deduped folder is later deleted from disk, the next
+    /// watcher event from a losing root will promote that root's copy.
+    /// Conversely, if the winning root *adds* a deduped folder name after
+    /// a losing root already claimed it, the two roots' contents will
+    /// interleave for that folder until the next full rescan. This is
+    /// fine for the design intent (resolution tiers stay stable while all
+    /// roots are present); document it for users with more dynamic libraries.
+    pub dedupe_depth: Option<usize>,
 }
 
 /// User-facing share schema. Three forms accepted:
@@ -67,6 +85,8 @@ enum ShareSpec {
         merge: Vec<PathBuf>,
         #[serde(default)]
         subdirs: BTreeMap<String, PathBuf>,
+        #[serde(default)]
+        dedupe_depth: Option<usize>,
         #[serde(default, rename = "mount")]
         mount_deprecated: Option<serde::de::IgnoredAny>,
     },
@@ -77,11 +97,11 @@ impl ShareSpec {
         match self {
             ShareSpec::Single(p) => Ok(ShareConfig {
                 merge: vec![p],
-                subdirs: BTreeMap::new(),
+                ..Default::default()
             }),
             ShareSpec::Many(v) => Ok(ShareConfig {
                 merge: v,
-                subdirs: BTreeMap::new(),
+                ..Default::default()
             }),
             ShareSpec::Full {
                 mount_deprecated: Some(_),
@@ -90,7 +110,16 @@ impl ShareSpec {
                 "share {share_name}: `mount:` was renamed to `subdirs:`; \
                  update your config (see config.advanced.yaml)"
             ),
-            ShareSpec::Full { merge, subdirs, .. } => Ok(ShareConfig { merge, subdirs }),
+            ShareSpec::Full {
+                merge,
+                subdirs,
+                dedupe_depth,
+                ..
+            } => Ok(ShareConfig {
+                merge,
+                subdirs,
+                dedupe_depth,
+            }),
         }
     }
 }
@@ -178,6 +207,7 @@ impl Config {
         cfg.canonicalize_roots();
         cfg.validate()?;
         cfg.warn_on_missing_roots();
+        cfg.warn_on_unusual_share_options();
         cfg.hide_set = Some(build_hide_set(&cfg.options.hide_patterns)?);
         Ok(cfg)
     }
@@ -246,6 +276,26 @@ impl Config {
         }
     }
 
+    /// Non-fatal warnings about share options that are well-formed but won't
+    /// do anything useful. Kept separate from `validate` (which bails) and
+    /// `warn_on_missing_roots` (which is about disk state).
+    fn warn_on_unusual_share_options(&self) {
+        for (name, share) in &self.shares {
+            if share.dedupe_depth.is_some() && share.merge.len() < 2 {
+                warn!(
+                    share = %name,
+                    "dedupe_depth has no effect with fewer than two merge roots; ignoring"
+                );
+            }
+            if share.dedupe_depth.is_some() && !share.subdirs.is_empty() {
+                warn!(
+                    share = %name,
+                    "dedupe_depth applies to `merge` roots only; `subdirs` are unaffected"
+                );
+            }
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.shares.is_empty() {
             anyhow::bail!("config has no shares");
@@ -272,6 +322,12 @@ impl Config {
                         p.display()
                     );
                 }
+            }
+            if let Some(0) = share.dedupe_depth {
+                anyhow::bail!(
+                    "share {name} has dedupe_depth: 0; use 1 or higher \
+                     (1 dedupes at the share's top-level folders)"
+                );
             }
             // Reject overlapping merge roots within a share. The union is
             // ambiguous (which root "wins" a file inside the overlap?) and the
@@ -361,6 +417,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
                 .collect(),
+            dedupe_depth: None,
         }
     }
 
@@ -609,6 +666,29 @@ mod tests {
             "shares:\n  Movies: /tmp\noptions:\n  totally_made_up: 1\n",
             "unknown",
         );
+    }
+
+    #[test]
+    fn load_parses_dedupe_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Movies:\n    merge:\n      - /tmp\n    dedupe_depth: 1\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert_eq!(cfg.shares["Movies"].dedupe_depth, Some(1));
+    }
+
+    #[test]
+    fn validate_rejects_dedupe_depth_zero() {
+        // Depth 0 would dedupe at the share root itself, which makes the
+        // second root contribute nothing — almost certainly a config error.
+        let mut s = share(&["/a", "/b"], &[]);
+        s.dedupe_depth = Some(0);
+        let cfg = cfg_with(one_share("Movies", s), Options::default());
+        assert_validate_err(&cfg, "dedupe_depth");
     }
 
     #[test]

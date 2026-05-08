@@ -27,6 +27,23 @@ shares:
       Archive: /mnt/archive/Movies
 ```
 
+For libraries split across resolution tiers (or any case where the same
+folder lives in multiple roots), `dedupe_depth: N` stops the union at depth
+N and lets the first-listed root win whole folders cleanly:
+
+```yaml
+shares:
+  Movies:
+    merge:
+      - /mnt/4k/Movies      # preferred
+      - /mnt/1080p/Movies   # fallback
+    dedupe_depth: 1         # per-movie folder wins from 4k; 1080p shadowed
+```
+
+`dedupe_depth` is enforced on the initial scan and on full rescans. If the
+winning root's copy of a deduped folder later disappears from disk, an
+incremental watcher event from a losing root may promote that root's copy.
+
 Copy `config.example.yaml` (minimal) or `config.advanced.yaml` (every option
 documented) and edit.
 
