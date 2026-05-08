@@ -28,3 +28,7 @@ options:
     - ".DS_Store"
     - "Thumbs.db"
     - "@eaDir"
+  # When false, symlinks in media roots are skipped (safer default —
+  # prevents an accidental symlink from exposing /etc/passwd over NFS).
+  # Set true if your library is built from symlink farms.
+  follow_symlinks: false

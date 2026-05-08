@@ -84,7 +84,10 @@ impl NFSFileSystem for FusionFs {
         };
 
         let mut file = tokio::fs::File::open(&backing).await.map_err(|e| {
-            warn!(path=%backing.display(), error=%e, "open failed");
+            // Don't include the host path in client-triggered logs — a
+            // misbehaving client can enumerate by hammering stale fileids.
+            // The fileid is enough to correlate with the tree if needed.
+            warn!(fileid = id, error = %e, "read open failed");
             io_to_nfs(&e)
         })?;
         let metadata = file.metadata().await.map_err(|e| io_to_nfs(&e))?;
@@ -130,17 +133,20 @@ impl NFSFileSystem for FusionFs {
         };
 
         // `start_after` is the cookie: 0 means "from the beginning", otherwise
-        // it's the fileid of the last entry the client received. Since
-        // NodeIds are stable for the process lifetime (no recycling), this
-        // resolves uniquely. If the cookie no longer maps to an entry in this
-        // directory (the entry was deleted), report end-of-dir to make the
-        // client restart with cookie=0 on its next attempt.
+        // it's the fileid of the last entry the client received. NodeIds are
+        // stable for the process lifetime so this resolves uniquely.
+        //
+        // If the cookie no longer matches an entry in this directory (because
+        // the file was deleted between RPCs), RFC 1813 §3.3.16 requires we
+        // return NFS3ERR_BAD_COOKIE so the client restarts pagination from
+        // the beginning. Returning `end:true` here would silently truncate
+        // the listing on Linux clients mid-stream.
         let start = if start_after == 0 {
             0
         } else {
             match ordered.iter().position(|(_, id)| *id == start_after) {
                 Some(p) => p + 1,
-                None => return Ok(ReadDirResult { entries: Vec::new(), end: true }),
+                None => return Err(nfsstat3::NFS3ERR_BAD_COOKIE),
             }
         };
 

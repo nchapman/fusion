@@ -1,7 +1,6 @@
 //! Build the in-memory tree by walking physical roots on startup.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -11,8 +10,184 @@ use crate::config::Config;
 use crate::tree::{CachedAttrs, DirSources, NodeKind, NodeId, Tree, ROOT_ID};
 
 /// Cap on recursive descent during scans. Protects against symlink loops
-/// (since we follow symlinks) without needing inode tracking.
+/// when `follow_symlinks` is enabled.
 const MAX_SCAN_DEPTH: usize = 64;
+
+/// Stat a path, respecting `config.options.follow_symlinks`. Returns `None`
+/// for entries we should skip (broken symlinks, or symlinks when follow is
+/// disabled). Files and directories return their target metadata.
+fn stat_entry(path: &Path, config: &Config) -> Option<std::fs::Metadata> {
+    let lstat = std::fs::symlink_metadata(path).ok()?;
+    if lstat.file_type().is_symlink() {
+        if !config.options.follow_symlinks {
+            debug!(path=%path.display(), "skipping symlink (follow_symlinks=false)");
+            return None;
+        }
+        // Follow.
+        std::fs::metadata(path).ok()
+    } else {
+        Some(lstat)
+    }
+}
+
+/// In-memory snapshot of a physical directory subtree, produced by reading
+/// the disk *without* holding the tree lock. The watcher's drainer reads the
+/// snapshot on a blocking thread, then takes the write lock briefly to apply
+/// it via `apply_snapshot`. This keeps NFS readers from stalling for the
+/// duration of a multi-second disk walk.
+#[derive(Debug)]
+pub struct DirSnapshot {
+    pub physical: PathBuf,
+    pub attrs: CachedAttrs,
+    pub children: HashMap<String, EntrySnapshot>,
+}
+
+#[derive(Debug)]
+pub enum EntrySnapshot {
+    File { path: PathBuf, attrs: CachedAttrs },
+    Dir(Box<DirSnapshot>),
+}
+
+/// Read a physical directory tree into a `DirSnapshot`. Pure disk I/O — safe
+/// to call from a `spawn_blocking` task without holding any lock. Returns
+/// `None` if the directory itself doesn't exist (caller should treat that as
+/// "directory deleted" and drop the corresponding source).
+pub fn snapshot_dir(physical: &Path, config: &Config, depth: usize) -> Option<DirSnapshot> {
+    if depth > MAX_SCAN_DEPTH {
+        warn!(path=%physical.display(), "max scan depth exceeded; symlink loop?");
+        return None;
+    }
+    let dir_md = std::fs::metadata(physical).ok()?;
+    let attrs = CachedAttrs::from_metadata(&dir_md);
+
+    let entries = match std::fs::read_dir(physical) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(path=%physical.display(), error=%e, "snapshot read_dir failed");
+            return None;
+        }
+    };
+
+    let mut children = HashMap::new();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if config.is_hidden(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(md) = stat_entry(&path, config) else { continue };
+        if md.is_dir() {
+            if let Some(sub) = snapshot_dir(&path, config, depth + 1) {
+                children.insert(name, EntrySnapshot::Dir(Box::new(sub)));
+            }
+        } else if md.is_file() {
+            let attrs = CachedAttrs::from_metadata(&md);
+            children.insert(name, EntrySnapshot::File { path, attrs });
+        }
+    }
+
+    Some(DirSnapshot {
+        physical: physical.to_path_buf(),
+        attrs,
+        children,
+    })
+}
+
+/// Apply a `DirSnapshot` to the in-memory tree. All work is in-memory — no
+/// disk I/O. Caller holds the write lock. Mirrors the diff logic that
+/// `rescan_dir` does inline, but without read_dir/metadata calls.
+pub fn apply_snapshot(
+    tree: &mut Tree,
+    virtual_id: NodeId,
+    snap: &DirSnapshot,
+    config: &Config,
+) {
+    tree.extend_dir_sources(virtual_id, snap.physical.clone());
+
+    let virtual_children: Vec<(String, NodeId)> = match tree.get(virtual_id) {
+        Some(node) => match &node.kind {
+            NodeKind::Directory { ordered, .. } => ordered.clone(),
+            _ => return,
+        },
+        None => return,
+    };
+    let virtual_names: HashSet<String> =
+        virtual_children.iter().map(|(n, _)| n.clone()).collect();
+
+    for (name, child_id) in &virtual_children {
+        let Some(child) = tree.get(*child_id) else { continue };
+        match &child.kind {
+            NodeKind::File { backing } => {
+                if !backing.starts_with(&snap.physical) {
+                    continue;
+                }
+                match snap.children.get(name) {
+                    Some(EntrySnapshot::File { path, attrs }) if path == backing => {
+                        if let Some(node) = tree.get_mut(*child_id) {
+                            node.attrs = attrs.clone();
+                        }
+                    }
+                    _ => {
+                        info!(name=%name, backing=%backing.display(), "removing stale file node");
+                        tree.remove_recursive(*child_id);
+                    }
+                }
+            }
+            NodeKind::Directory { sources, .. } => {
+                let child_phys = snap.physical.join(name);
+                let backed_here = match sources {
+                    DirSources::Physical(paths) => paths.iter().any(|p| p == &child_phys),
+                    DirSources::Synthetic => false,
+                };
+                if !backed_here {
+                    continue;
+                }
+                match snap.children.get(name) {
+                    Some(EntrySnapshot::Dir(sub)) => {
+                        apply_snapshot(tree, *child_id, sub, config);
+                    }
+                    _ => {
+                        let now_empty = tree.drop_dir_source(*child_id, &child_phys);
+                        if now_empty {
+                            info!(name=%name, "removing stale directory node (no sources left)");
+                            tree.remove_recursive(*child_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (name, entry) in &snap.children {
+        if virtual_names.contains(name) {
+            continue;
+        }
+        match entry {
+            EntrySnapshot::Dir(sub) => {
+                if let Some(child_id) = tree.add_child(
+                    virtual_id,
+                    name.clone(),
+                    empty_dir_kind(),
+                    sub.attrs.clone(),
+                ) {
+                    apply_snapshot(tree, child_id, sub, config);
+                }
+            }
+            EntrySnapshot::File { path, attrs } => {
+                let kind = NodeKind::File { backing: path.clone() };
+                if let Some(child_id) =
+                    tree.add_child(virtual_id, name.clone(), kind, attrs.clone())
+                {
+                    tree.index_file(path.clone(), child_id);
+                }
+            }
+        }
+    }
+}
 
 /// Build an empty directory NodeKind. Empty == trivially sorted, so
 /// `add_child` on this dir will maintain the sort invariant. Bulk-build
@@ -23,6 +198,7 @@ fn empty_dir_kind() -> NodeKind {
         by_name: HashMap::new(),
         ordered: Vec::new(),
         sorted: true,
+        subdir_count: 0,
         sources: DirSources::Synthetic,
     }
 }
@@ -109,15 +285,7 @@ fn scan_into(
             continue;
         }
         let path = entry.path();
-        // Use std::fs::metadata (which follows symlinks) — DirEntry::metadata
-        // is `lstat` on Unix and would classify symlinks as their own type.
-        let md = match std::fs::metadata(&entry.path()) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path=%path.display(), error=%e, "stat failed");
-                continue;
-            }
-        };
+        let Some(md) = stat_entry(&path, config) else { continue };
         let attrs = CachedAttrs::from_metadata(&md);
 
         if md.is_dir() {
@@ -133,7 +301,7 @@ fn scan_into(
                 backing: path.clone(),
             };
             if let Some(child_id) = tree.add_child(virtual_id, name, kind, attrs) {
-                tree.path_index.insert(path, child_id);
+                tree.index_file(path, child_id);
             }
         } else {
             // Symlink, socket, fifo, etc. — skip in v1.
@@ -178,15 +346,7 @@ fn merge_into(
             continue;
         }
         let path = entry.path();
-        // Use std::fs::metadata (which follows symlinks) — DirEntry::metadata
-        // is `lstat` on Unix and would classify symlinks as their own type.
-        let md = match std::fs::metadata(&entry.path()) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path=%path.display(), error=%e, "stat failed");
-                continue;
-            }
-        };
+        let Some(md) = stat_entry(&path, config) else { continue };
         let attrs = CachedAttrs::from_metadata(&md);
 
         if md.is_dir() {
@@ -211,7 +371,7 @@ fn merge_into(
                 backing: path.clone(),
             };
             if let Some(child_id) = tree.add_child(virtual_id, name.clone(), kind, attrs) {
-                tree.path_index.insert(path, child_id);
+                tree.index_file(path, child_id);
             } else {
                 // Already-present-with-same-path (rescan case) is silent;
                 // genuine cross-root shadowing is logged.
@@ -234,155 +394,6 @@ fn merge_into(
     }
 }
 
-/// Re-scan a single physical root into the tree. Used by the watcher.
-/// The `virtual_parent` is the virtual dir that this physical path feeds.
-/// Re-scan a single physical root and reconcile the tree against it.
-///
-/// Unlike the initial-build merge, this is destructive: virtual children
-/// whose backing path lived under `physical` and is gone from disk are
-/// removed; surviving children get fresh attrs; new on-disk entries are
-/// added. Children backed by *other* physical roots in the same union are
-/// left alone — they aren't this rescan's responsibility.
-pub fn rescan_path(
-    tree: &mut Tree,
-    virtual_id: NodeId,
-    physical: &PathBuf,
-    config: &Config,
-) {
-    rescan_dir(tree, virtual_id, physical, config, 0);
-    tree.finalize_sort();
-}
-
-fn rescan_dir(
-    tree: &mut Tree,
-    virtual_id: NodeId,
-    physical: &Path,
-    config: &Config,
-    depth: usize,
-) {
-    if depth > MAX_SCAN_DEPTH {
-        warn!(path=%physical.display(), "max scan depth exceeded; symlink loop?");
-        return;
-    }
-
-    // Make sure this physical path is registered as a source for the dir.
-    tree.extend_dir_sources(virtual_id, physical.to_path_buf());
-
-    // Read the on-disk entries up front so we can iterate the virtual side
-    // without holding the disk handle.
-    let on_disk: HashMap<String, (PathBuf, Metadata)> = match std::fs::read_dir(physical) {
-        Ok(it) => it
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                if config.is_hidden(&name) {
-                    return None;
-                }
-                let path = e.path();
-                let md = std::fs::metadata(&path).ok()?; // follows symlinks
-                Some((name, (path, md)))
-            })
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Directory itself is gone — drop our source for it. If it has no
-            // remaining sources we remove the virtual node entirely.
-            let path = physical.to_path_buf();
-            let now_empty = tree.drop_dir_source(virtual_id, &path);
-            if now_empty && virtual_id != ROOT_ID {
-                info!(path=%physical.display(), "removing virtual dir; underlying directory deleted");
-                tree.remove_recursive(virtual_id);
-            }
-            return;
-        }
-        Err(e) => {
-            warn!(path=%physical.display(), error=%e, "rescan read_dir failed");
-            return;
-        }
-    };
-
-    // Snapshot the virtual children once so we can mutate the tree while
-    // diffing. Cheap: a single Vec clone of (name, NodeId) pairs.
-    let virtual_children: Vec<(String, NodeId)> = match tree.get(virtual_id) {
-        Some(node) => match &node.kind {
-            NodeKind::Directory { ordered, .. } => ordered.clone(),
-            _ => return,
-        },
-        None => return,
-    };
-
-    let virtual_names: HashSet<&str> = virtual_children
-        .iter()
-        .map(|(n, _)| n.as_str())
-        .collect();
-    let virtual_names: HashSet<String> = virtual_names.iter().map(|s| s.to_string()).collect();
-
-    for (name, child_id) in &virtual_children {
-        let Some(child) = tree.get(*child_id) else { continue };
-        match &child.kind {
-            NodeKind::File { backing } => {
-                let backed_here = backing.starts_with(physical);
-                if !backed_here {
-                    continue; // From another root — leave alone.
-                }
-                match on_disk.get(name) {
-                    Some((path, md)) if md.is_file() && path == backing => {
-                        let new_attrs = CachedAttrs::from_metadata(md);
-                        if let Some(node) = tree.get_mut(*child_id) {
-                            node.attrs = new_attrs;
-                        }
-                    }
-                    _ => {
-                        info!(name=%name, backing=%backing.display(), "removing stale file node");
-                        tree.remove_recursive(*child_id);
-                    }
-                }
-            }
-            NodeKind::Directory { sources, .. } => {
-                let child_phys = physical.join(name);
-                let backed_here = match sources {
-                    DirSources::Physical(paths) => paths.iter().any(|p| p == &child_phys),
-                    DirSources::Synthetic => false,
-                };
-                if !backed_here {
-                    continue;
-                }
-                match on_disk.get(name) {
-                    Some((path, md)) if md.is_dir() => {
-                        rescan_dir(tree, *child_id, path, config, depth + 1);
-                    }
-                    _ => {
-                        // Disk dir gone (or replaced by a non-dir). Drop our
-                        // source from the union; if no sources remain, the
-                        // dir is fully gone and we remove it.
-                        let now_empty = tree.drop_dir_source(*child_id, &child_phys);
-                        if now_empty {
-                            info!(name=%name, "removing stale directory node (no sources left)");
-                            tree.remove_recursive(*child_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Add anything on disk that the virtual tree didn't already have.
-    for (name, (path, md)) in on_disk {
-        if virtual_names.contains(&name) {
-            // Already handled above (refresh / remove / recurse).
-            continue;
-        }
-        let attrs = CachedAttrs::from_metadata(&md);
-        if md.is_dir() {
-            if let Some(child_id) =
-                tree.add_child(virtual_id, name.clone(), empty_dir_kind(), attrs)
-            {
-                rescan_dir(tree, child_id, &path, config, depth + 1);
-            }
-        } else if md.is_file() {
-            let kind = NodeKind::File { backing: path.clone() };
-            if let Some(child_id) = tree.add_child(virtual_id, name, kind, attrs) {
-                tree.path_index.insert(path, child_id);
-            }
-        }
-    }
-}
+// (Legacy single-phase `rescan_path` removed. Watcher now uses the two-phase
+// `snapshot_dir` + `apply_snapshot` pair so disk I/O happens outside the
+// tree write lock.)

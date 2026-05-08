@@ -46,6 +46,11 @@ pub struct Options {
     pub hide_dotfiles: bool,
     #[serde(default)]
     pub hide_patterns: Vec<String>,
+    /// If true, scan follows symbolic links and exposes their targets as
+    /// regular files. Off by default because a symlink inside a media root
+    /// to e.g. `/etc/passwd` would otherwise be served over NFS.
+    #[serde(default)]
+    pub follow_symlinks: bool,
 }
 
 impl Default for Options {
@@ -53,6 +58,7 @@ impl Default for Options {
         Self {
             hide_dotfiles: true,
             hide_patterns: Vec::new(),
+            follow_symlinks: false,
         }
     }
 }

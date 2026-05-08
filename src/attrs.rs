@@ -42,10 +42,12 @@ fn to_nfstime(t: SystemTime) -> nfstime3 {
 
 pub fn fattr3_for(node: &Node, server_id: u64) -> fattr3 {
     let (ftype, mode_default, nlink) = match &node.kind {
-        NodeKind::Directory { ordered, .. } => {
-            // nlink for dirs is conventionally 2 + number of subdirectories.
-            let subdirs = ordered.len() as u32; // approximation
-            (ftype3::NF3DIR, 0o555, 2 + subdirs)
+        NodeKind::Directory { subdir_count, .. } => {
+            // Unix convention: nlink = 2 (`.` + parent's `..` to here) + one
+            // per subdirectory's `..`. Files are NOT counted. macOS `find`
+            // uses `nlink - 2` to short-circuit traversal, so over-counting
+            // makes find skip real subdirectories.
+            (ftype3::NF3DIR, 0o555, 2 + *subdir_count)
         }
         NodeKind::File { .. } => (ftype3::NF3REG, 0o444, 1),
     };

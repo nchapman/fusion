@@ -5,7 +5,7 @@
 //! fileid 0); index 1 is always the root.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub type NodeId = u64;
@@ -44,6 +44,12 @@ pub enum NodeKind {
         /// build it's unordered to avoid O(n²) insertion.
         ordered: Vec<(String, NodeId)>,
         sorted: bool,
+        /// Number of *directory* children. Maintained incrementally so that
+        /// NFS `nlink` (`2 + subdirs`, the Unix convention) doesn't require
+        /// an O(children) scan per `getattr`. macOS `find` uses `nlink-2` to
+        /// short-circuit traversal, so over-counting (e.g. counting files)
+        /// makes `find` miss subdirectories.
+        subdir_count: u32,
         sources: DirSources,
     },
     File {
@@ -83,9 +89,11 @@ impl Node {
 
 pub struct Tree {
     nodes: Vec<Option<Node>>,
-    /// Reverse index from physical path → virtual node, for watcher lookups.
-    /// Files and directories both map here.
-    pub path_index: HashMap<PathBuf, NodeId>,
+    /// Reverse index from physical path → virtual node id, for watcher
+    /// lookups. Both file and directory paths are registered. Mutated only
+    /// via `index_file` and the directory-source helpers; readers go
+    /// through `lookup_path`.
+    path_index: HashMap<PathBuf, NodeId>,
     /// Stable verifier returned to clients; changes only on process restart.
     pub server_id: u64,
 }
@@ -100,6 +108,7 @@ impl Tree {
                 by_name: HashMap::new(),
                 ordered: Vec::new(),
                 sorted: true,
+                subdir_count: 0,
                 sources: DirSources::Synthetic,
             },
             attrs: CachedAttrs::synthetic_dir(),
@@ -151,6 +160,7 @@ impl Tree {
             _ => return None,
         }
         let id = self.alloc_id();
+        let child_is_dir = matches!(kind, NodeKind::Directory { .. });
         let node = Node {
             id,
             parent: Some(parent),
@@ -165,6 +175,7 @@ impl Tree {
             by_name,
             ordered,
             sorted,
+            subdir_count,
             ..
         } = &mut parent_node.kind
         {
@@ -177,6 +188,17 @@ impl Tree {
             } else {
                 ordered.push((name, id));
             }
+            if child_is_dir {
+                *subdir_count += 1;
+            }
+        }
+        // Bump parent mtime so Linux NFS clients invalidate dentry cache.
+        // RFC 2623 / Linux behavior: client uses parent dir mtime as the
+        // freshness key; without this, ls can serve stale listings.
+        let now = std::time::SystemTime::now();
+        if let Some(p) = self.get_mut(parent) {
+            p.attrs.mtime = now;
+            p.attrs.ctime = now;
         }
         Some(id)
     }
@@ -236,12 +258,17 @@ impl Tree {
             }
         }
         // Detach from parent (only for the top-level id).
-        if let Some(parent_id) = self.get(id).and_then(|n| n.parent) {
+        let removed_is_dir = self.get(id).map(|n| n.is_dir()).unwrap_or(false);
+        let parent_id_opt = self.get(id).and_then(|n| n.parent);
+        if let Some(parent_id) = parent_id_opt {
             let name = self.get(id).map(|n| n.name.clone());
             if let Some(name) = name {
                 if let Some(parent) = self.get_mut(parent_id) {
                     if let NodeKind::Directory {
-                        by_name, ordered, ..
+                        by_name,
+                        ordered,
+                        subdir_count,
+                        ..
                     } = &mut parent.kind
                     {
                         by_name.remove(&name);
@@ -250,8 +277,17 @@ impl Tree {
                         {
                             ordered.remove(pos);
                         }
+                        if removed_is_dir && *subdir_count > 0 {
+                            *subdir_count -= 1;
+                        }
                     }
                 }
+            }
+            // Bump parent mtime — see add_child for rationale.
+            let now = std::time::SystemTime::now();
+            if let Some(p) = self.get_mut(parent_id) {
+                p.attrs.mtime = now;
+                p.attrs.ctime = now;
             }
         }
         for nid in to_drop {
@@ -297,6 +333,19 @@ impl Tree {
 
     pub fn node_count(&self) -> usize {
         self.nodes.iter().filter(|n| n.is_some()).count()
+    }
+
+    /// Register a physical path → file node mapping. Use this rather than
+    /// poking `path_index` directly so that the (file_node, path_index entry)
+    /// invariant lives in one place.
+    pub fn index_file(&mut self, path: PathBuf, id: NodeId) {
+        self.path_index.insert(path, id);
+    }
+
+    /// Look up the virtual node id for a physical path. Returns the *deepest*
+    /// match: see [`Watcher`] routing for ancestor-walk semantics.
+    pub fn lookup_path(&self, path: &Path) -> Option<NodeId> {
+        self.path_index.get(path).copied()
     }
 
     /// Remove `path` from a directory's physical source list. Returns true if

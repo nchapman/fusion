@@ -1,22 +1,34 @@
 //! Filesystem watcher.
 //!
-//! v1 strategy: per-root debounced full rescan.
+//! Pipeline:
 //!
-//! We map each watched physical path back to the virtual directory it feeds,
-//! debounce events for ~2 seconds, then re-merge that root into the tree.
-//! The rescan is non-destructive (existing nodes are preserved by name) and
-//! the next watcher event for a removed file will clean up the stale node.
+//! ```text
+//!   notify (OS thread, sync)
+//!     -> notify-debouncer-full (2s window, dedupe by inode)
+//!     -> bounded mpsc channel of WatchSignal
+//!     -> async drainer task
+//!         phase 1: resolve event paths to (root, virtual_id) via path_index
+//!                  under a brief read lock
+//!         phase 2: spawn_blocking — snapshot each dirty root from disk,
+//!                  WITHOUT holding any tree lock
+//!         phase 3: take write lock briefly, apply each snapshot's diff,
+//!                  release
+//! ```
 //!
-//! When the watcher reports an unrecoverable error or a queue overflow, we
-//! schedule a full rescan of every share root.
+//! Lock-hold time is bounded by the apply phase only (no disk I/O), which
+//! keeps NFS read latency clean even during a multi-second cold scan of a
+//! spinning disk.
 //!
-//! Concurrency model: the notify callback is sync (runs on notify's thread).
-//! It pushes dirty (physical_root, virtual_id) pairs onto an unbounded mpsc
-//! channel. A single dedicated drainer task receives, coalesces everything
-//! currently queued into a HashSet, takes the tree write lock once, and
-//! rescans each unique root. This bounds write-lock contention even if the
-//! filesystem is being hammered (e.g. rsync) — backpressure is the channel
-//! buffer; lock churn stays at one acquisition per drain cycle.
+//! Backpressure: the channel is bounded. On full, events are dropped with a
+//! warn log. The reconciliatory rescan model means a dropped event is not a
+//! correctness problem: the next event for any path inside the same root, or
+//! a fallback periodic scan, restores consistency. (No periodic fallback in
+//! v1; documented as a known limit.)
+//!
+//! Overflow handling: notify reports queue overflows differently per-OS.
+//! On macOS FSEvents the kernel sets `Flag::MustScanSubDirs` inside an `Ok`
+//! event; on Linux inotify it surfaces as `Err`. Both routes emit a
+//! `WatchSignal::RescanAll` to force re-snapshot of every root.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -24,17 +36,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use notify::event::Flag;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::builder::{apply_snapshot, snapshot_dir, DirSnapshot};
 use crate::config::Config;
 use crate::tree::{NodeId, NodeKind, Tree, ROOT_ID};
 
+const EVENT_CHANNEL_CAP: usize = 4096;
+
+/// What the notify callback sends to the drainer. Paths are deduplicated and
+/// routed to virtual ids inside the drainer, not here.
+#[derive(Debug)]
+enum WatchSignal {
+    Path(PathBuf),
+    RescanAll,
+}
+
 /// Information about a watched root: which virtual directory it feeds.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WatchRoot {
     pub physical: PathBuf,
     pub virtual_id: NodeId,
@@ -71,102 +95,57 @@ pub struct Watcher {
     _debouncer: Debouncer<RecommendedWatcher, FileIdMap>,
 }
 
-/// What to rescan: a (physical_path, virtual_id) pair. Sent on the dirty
-/// channel and coalesced by the drainer.
-type DirtyRoot = (PathBuf, NodeId);
-
-/// Send a path event to the drainer, picking the deepest virtual node we know
-/// about. We first ask the live tree's `path_index` (consulted under a read
-/// lock) for a virtual id corresponding to any ancestor of the event path —
-/// this routes to the changed directory itself rather than always falling
-/// back to the share root. Only on miss do we degrade to the configured
-/// watch root.
-async fn route_event(
-    path: &Path,
-    roots: &[WatchRoot],
-    tree: &Arc<RwLock<Tree>>,
-) -> Option<DirtyRoot> {
-    {
-        let tree = tree.read().await;
-        let mut p = path;
-        loop {
-            if let Some(&vid) = tree.path_index.get(p) {
-                // Only route to directory nodes — rescan_path expects a dir.
-                // path_index also contains file paths; for those we keep
-                // walking up to the containing directory.
-                if let Some(node) = tree.get(vid) {
-                    if node.is_dir() {
-                        return Some((p.to_path_buf(), vid));
-                    }
-                }
-            }
-            match p.parent() {
-                Some(parent) if parent != p => p = parent,
-                _ => break,
-            }
-        }
-    }
-    match_root(roots, path).map(|r| (r.physical.clone(), r.virtual_id))
-}
-
 impl Watcher {
     pub fn start(
         config: Arc<Config>,
         tree: Arc<RwLock<Tree>>,
         roots: Vec<WatchRoot>,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::unbounded_channel::<DirtyRoot>();
+        let (tx, rx) = mpsc::channel::<WatchSignal>(EVENT_CHANNEL_CAP);
 
-        // Capture the current runtime handle so the notify callback (which
-        // runs on its own non-tokio thread) can still spawn tasks.
+        // Capture runtime handle for the notify thread.
         let rt = Handle::current();
 
-        // Spawn the drainer. It owns the receiver, coalesces queued events,
-        // and is the only place that takes the tree write lock for rescans.
-        rt.spawn(drain_dirty(rx, config.clone(), tree.clone()));
+        rt.spawn(drain(rx, config.clone(), tree.clone(), roots.clone()));
 
-        let roots_for_handler = roots.clone();
-        let tree_for_handler = tree.clone();
-        let tx_events = tx.clone();
-        let tx_errors = tx.clone();
-        let rt_cb = rt.clone();
-
+        let tx_cb = tx.clone();
         let mut debouncer = new_debouncer(
             Duration::from_secs(2),
             None,
             move |res: DebounceEventResult| match res {
                 Ok(events) => {
-                    // Hand routing off to an async task so we can consult the
-                    // tree's path_index without blocking the notify thread.
-                    let mut paths: Vec<PathBuf> = Vec::new();
+                    let mut overflow = false;
+                    let mut paths: HashSet<PathBuf> = HashSet::new();
                     for ev in events {
-                        for path in &ev.paths {
-                            paths.push(path.clone());
+                        // FSEvents (macOS) reports kernel-queue overflow as a
+                        // flag inside an Ok event. Treat it as "we lost some
+                        // events; rescan everything."
+                        if matches!(ev.flag(), Some(Flag::Rescan)) {
+                            overflow = true;
+                        }
+                        for p in &ev.paths {
+                            paths.insert(p.clone());
                         }
                     }
-                    let roots = roots_for_handler.clone();
-                    let tree = tree_for_handler.clone();
-                    let tx = tx_events.clone();
-                    rt_cb.spawn(async move {
-                        let mut dirty: HashSet<DirtyRoot> = HashSet::new();
-                        for path in &paths {
-                            match route_event(path, &roots, &tree).await {
-                                Some(d) => { dirty.insert(d); }
-                                None => debug!(path=%path.display(), "event did not match any watched root"),
-                            }
+                    if overflow {
+                        let _ = tx_cb.try_send(WatchSignal::RescanAll);
+                        return;
+                    }
+                    for path in paths {
+                        if let Err(e) = tx_cb.try_send(WatchSignal::Path(path)) {
+                            // Channel is full — log and drop. The reconciliatory
+                            // model means we'll catch up on the next event or
+                            // rescan; nothing is silently lost permanently.
+                            warn!(error=?e, "watcher channel full; dropping event");
+                            break;
                         }
-                        for d in dirty {
-                            let _ = tx.send(d);
-                        }
-                    });
+                    }
                 }
                 Err(errors) => {
                     for e in errors {
-                        error!(error=?e, "watcher error; falling back to full rescan");
+                        error!(error=?e, "watcher error; scheduling full rescan");
                     }
-                    for r in &roots_for_handler {
-                        let _ = tx_errors.send((r.physical.clone(), r.virtual_id));
-                    }
+                    let _ = tx_cb.try_send(WatchSignal::RescanAll);
                 }
             },
         )?;
@@ -181,37 +160,123 @@ impl Watcher {
         }
         info!(count = roots.len(), "watching roots");
 
-        Ok(Self {
-            _debouncer: debouncer,
-        })
+        Ok(Self { _debouncer: debouncer })
     }
 }
 
-async fn drain_dirty(
-    mut rx: mpsc::UnboundedReceiver<DirtyRoot>,
+/// Drainer: receive signals, batch them, route paths to virtual ids, snapshot
+/// disk state without the lock, then apply under write lock briefly.
+async fn drain(
+    mut rx: mpsc::Receiver<WatchSignal>,
     config: Arc<Config>,
     tree: Arc<RwLock<Tree>>,
+    roots: Vec<WatchRoot>,
 ) {
     while let Some(first) = rx.recv().await {
-        // Coalesce: drain everything currently queued into a single set, so
-        // a flurry of events resolves to one rescan pass per affected root.
-        let mut dirty: HashSet<DirtyRoot> = HashSet::new();
-        dirty.insert(first);
-        while let Ok(extra) = rx.try_recv() {
-            dirty.insert(extra);
+        // 1. Coalesce queued signals.
+        let mut signals = vec![first];
+        while let Ok(s) = rx.try_recv() {
+            signals.push(s);
         }
 
-        let mut tree_guard = tree.write().await;
-        for (path, vid) in &dirty {
-            info!(root=%path.display(), virtual_id=vid, "rescanning after watcher event");
-            crate::builder::rescan_path(&mut tree_guard, *vid, path, &config);
+        // 2. Compute the dirty (root_path, virtual_id) set.
+        let dirty = if signals.iter().any(|s| matches!(s, WatchSignal::RescanAll)) {
+            roots
+                .iter()
+                .map(|r| (r.physical.clone(), r.virtual_id))
+                .collect::<HashSet<_>>()
+        } else {
+            let paths: HashSet<PathBuf> = signals
+                .into_iter()
+                .filter_map(|s| match s {
+                    WatchSignal::Path(p) => Some(p),
+                    WatchSignal::RescanAll => None,
+                })
+                .collect();
+            // Read lock briefly to consult path_index.
+            let tree_r = tree.read().await;
+            let mut out = HashSet::new();
+            for path in &paths {
+                if let Some(d) = route_path(path, &roots, &tree_r) {
+                    out.insert(d);
+                } else {
+                    debug!(path=%path.display(), "event did not match any watched root");
+                }
+            }
+            out
+        };
+
+        if dirty.is_empty() {
+            continue;
         }
-        // Lock dropped here; NFS readers can resume between drain cycles.
+
+        // 3. Phase 1 — snapshot each dirty root on a blocking thread, no lock.
+        let cfg_b = config.clone();
+        let snapshots: Vec<(PathBuf, NodeId, Option<DirSnapshot>)> =
+            tokio::task::spawn_blocking(move || {
+                dirty
+                    .into_iter()
+                    .map(|(path, vid)| {
+                        let snap = snapshot_dir(&path, &cfg_b, 0);
+                        (path, vid, snap)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+
+        // 4. Phase 2 — apply under write lock briefly.
+        {
+            let mut tree_w = tree.write().await;
+            for (path, vid, snap) in snapshots {
+                match snap {
+                    Some(s) => {
+                        info!(root=%path.display(), virtual_id=vid, "applying snapshot");
+                        apply_snapshot(&mut tree_w, vid, &s, &config);
+                    }
+                    None => {
+                        // Underlying path is gone — drop our source; if the
+                        // virtual dir has no sources left, remove it.
+                        let now_empty = tree_w.drop_dir_source(vid, &path);
+                        if now_empty && vid != ROOT_ID {
+                            info!(path=%path.display(), "removing virtual dir; underlying directory deleted");
+                            tree_w.remove_recursive(vid);
+                        }
+                    }
+                }
+            }
+            tree_w.finalize_sort();
+        }
     }
 }
 
-fn match_root<'a>(roots: &'a [WatchRoot], path: &Path) -> Option<&'a WatchRoot> {
-    // Pick the longest prefix match.
+/// Route an event path to the deepest watched virtual directory: walk up
+/// ancestors, looking each up in `path_index`; on miss fall back to the
+/// configured watch roots' longest prefix match.
+fn route_path(
+    path: &Path,
+    roots: &[WatchRoot],
+    tree: &Tree,
+) -> Option<(PathBuf, NodeId)> {
+    let mut p = path;
+    loop {
+        if let Some(vid) = tree.lookup_path(p) {
+            // Only route to dirs (path_index also contains files).
+            if let Some(node) = tree.get(vid) {
+                if node.is_dir() {
+                    return Some((p.to_path_buf(), vid));
+                }
+            }
+        }
+        match p.parent() {
+            Some(parent) if parent != p => p = parent,
+            _ => break,
+        }
+    }
+    match_root_prefix(roots, path).map(|r| (r.physical.clone(), r.virtual_id))
+}
+
+fn match_root_prefix<'a>(roots: &'a [WatchRoot], path: &Path) -> Option<&'a WatchRoot> {
     let mut best: Option<&WatchRoot> = None;
     let mut best_len = 0;
     for r in roots {
@@ -225,4 +290,3 @@ fn match_root<'a>(roots: &'a [WatchRoot], path: &Path) -> Option<&'a WatchRoot> 
     }
     best
 }
-
