@@ -58,7 +58,7 @@ pub fn fattr3_for(node: &Node, server_id: u64) -> fattr3 {
     };
     fattr3 {
         ftype,
-        mode: mode as u32,
+        mode,
         nlink,
         uid: 0,
         gid: 0,

@@ -143,3 +143,151 @@ impl Config {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(shares: BTreeMap<String, ShareConfig>, options: Options) -> Config {
+        Config {
+            server: ServerConfig::default(),
+            shares,
+            options,
+        }
+    }
+
+    fn share(merge: &[&str], mount: &[(&str, &str)]) -> ShareConfig {
+        ShareConfig {
+            merge: merge.iter().map(PathBuf::from).collect(),
+            mount: mount
+                .iter()
+                .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
+                .collect(),
+        }
+    }
+
+    fn one_share(name: &str, s: ShareConfig) -> BTreeMap<String, ShareConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(name.to_string(), s);
+        m
+    }
+
+    #[test]
+    fn defaults_hide_dotfiles_and_skip_symlinks() {
+        let opts = Options::default();
+        assert!(opts.hide_dotfiles);
+        assert!(!opts.follow_symlinks);
+        assert!(opts.hide_patterns.is_empty());
+    }
+
+    #[test]
+    fn default_bind_is_all_interfaces_2049() {
+        assert_eq!(ServerConfig::default().bind, "0.0.0.0:2049");
+    }
+
+    #[test]
+    fn is_hidden_dotfiles() {
+        let cfg = cfg_with(BTreeMap::new(), Options::default());
+        assert!(cfg.is_hidden(".DS_Store"));
+        assert!(cfg.is_hidden(".hidden"));
+        assert!(!cfg.is_hidden("Movie.mkv"));
+    }
+
+    #[test]
+    fn is_hidden_dotfiles_disabled() {
+        let cfg = cfg_with(
+            BTreeMap::new(),
+            Options { hide_dotfiles: false, ..Options::default() },
+        );
+        assert!(!cfg.is_hidden(".DS_Store"));
+    }
+
+    #[test]
+    fn is_hidden_patterns_are_case_insensitive_substrings() {
+        let cfg = cfg_with(
+            BTreeMap::new(),
+            Options {
+                hide_dotfiles: false,
+                hide_patterns: vec!["thumbs.db".into(), "@eaDir".into()],
+                follow_symlinks: false,
+            },
+        );
+        assert!(cfg.is_hidden("Thumbs.db"));
+        assert!(cfg.is_hidden("THUMBS.DB"));
+        assert!(cfg.is_hidden("My@eadirCache"));
+        assert!(!cfg.is_hidden("Movie.mkv"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_shares_map() {
+        let cfg = cfg_with(BTreeMap::new(), Options::default());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_share_with_no_sources() {
+        let cfg = cfg_with(one_share("Movies", share(&[], &[])), Options::default());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_share_name_with_slash() {
+        let cfg = cfg_with(
+            one_share("a/b", share(&["/m"], &[])),
+            Options::default(),
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_relative_merge_root() {
+        let cfg = cfg_with(
+            one_share("Movies", share(&["relative/path"], &[])),
+            Options::default(),
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(format!("{err}").contains("absolute"));
+    }
+
+    #[test]
+    fn validate_rejects_relative_mount_root() {
+        let cfg = cfg_with(
+            one_share("Movies", share(&[], &[("Archive", "rel")])),
+            Options::default(),
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_mount_name_with_slash() {
+        let cfg = cfg_with(
+            one_share("Movies", share(&[], &[("a/b", "/m")])),
+            Options::default(),
+        );
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_mount_only_share() {
+        let cfg = cfg_with(
+            one_share("Movies", share(&[], &[("Archive", "/m")])),
+            Options::default(),
+        );
+        cfg.validate().expect("mount-only should be valid");
+    }
+
+    #[test]
+    fn load_parses_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Movies:\n    merge:\n      - /tmp\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert!(cfg.shares.contains_key("Movies"));
+        assert_eq!(cfg.server.bind, "0.0.0.0:2049");
+        assert!(cfg.options.hide_dotfiles);
+    }
+}

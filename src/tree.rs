@@ -299,12 +299,14 @@ impl Tree {
             if let Some(node) = self.nodes.get_mut(nid as usize).and_then(|o| o.take()) {
                 if let NodeKind::File { backing } = &node.kind {
                     self.path_index.remove(backing);
-                } else if let NodeKind::Directory { sources, .. } = &node.kind {
-                    if let DirSources::Physical(paths) = sources {
-                        for p in paths {
-                            if self.path_index.get(p) == Some(&nid) {
-                                self.path_index.remove(p);
-                            }
+                } else if let NodeKind::Directory {
+                    sources: DirSources::Physical(paths),
+                    ..
+                } = &node.kind
+                {
+                    for p in paths {
+                        if self.path_index.get(p) == Some(&nid) {
+                            self.path_index.remove(p);
                         }
                     }
                 }
@@ -375,5 +377,219 @@ impl Tree {
             self.path_index.remove(path);
         }
         now_empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn empty_dir() -> NodeKind {
+        NodeKind::Directory {
+            by_name: FastMap::default(),
+            ordered: Vec::new(),
+            sorted: true,
+            subdir_count: 0,
+            sources: DirSources::Synthetic,
+        }
+    }
+
+    fn file_kind(path: &str) -> NodeKind {
+        NodeKind::File { backing: PathBuf::from(path) }
+    }
+
+    fn dir_attrs() -> CachedAttrs {
+        CachedAttrs::synthetic_dir()
+    }
+
+    fn subdir_count(tree: &Tree, id: NodeId) -> u32 {
+        match &tree.get(id).unwrap().kind {
+            NodeKind::Directory { subdir_count, .. } => *subdir_count,
+            _ => panic!("not a dir"),
+        }
+    }
+
+    fn ordered_names(tree: &Tree, id: NodeId) -> Vec<String> {
+        match &tree.get(id).unwrap().kind {
+            NodeKind::Directory { ordered, .. } => {
+                ordered.iter().map(|(n, _)| n.clone()).collect()
+            }
+            _ => panic!("not a dir"),
+        }
+    }
+
+    #[test]
+    fn root_exists_and_is_synthetic() {
+        let tree = Tree::new(42);
+        let root = tree.get(ROOT_ID).expect("root present");
+        assert!(root.is_dir());
+        assert_eq!(root.parent, None);
+        match &root.kind {
+            NodeKind::Directory { sources, .. } => {
+                assert!(matches!(sources, DirSources::Synthetic));
+            }
+            _ => panic!("root should be a dir"),
+        }
+    }
+
+    #[test]
+    fn add_child_inserts_and_indexes_by_name() {
+        let mut tree = Tree::new(0);
+        let id = tree
+            .add_child(ROOT_ID, "Movies".into(), empty_dir(), dir_attrs())
+            .expect("inserted");
+        assert_eq!(tree.child(ROOT_ID, "Movies"), Some(id));
+        assert_eq!(ordered_names(&tree, ROOT_ID), vec!["Movies".to_string()]);
+    }
+
+    #[test]
+    fn add_child_returns_none_on_name_collision() {
+        let mut tree = Tree::new(0);
+        let first = tree
+            .add_child(ROOT_ID, "dup".into(), empty_dir(), dir_attrs())
+            .expect("inserted");
+        let next_id_before = tree.nodes.len() as NodeId;
+        let collision = tree.add_child(ROOT_ID, "dup".into(), empty_dir(), dir_attrs());
+        assert_eq!(collision, None);
+        // Failed insert must not consume an id slot.
+        assert_eq!(tree.nodes.len() as NodeId, next_id_before);
+        assert_eq!(tree.child(ROOT_ID, "dup"), Some(first));
+    }
+
+    #[test]
+    fn subdir_count_tracks_directories_only() {
+        let mut tree = Tree::new(0);
+        tree.add_child(ROOT_ID, "a".into(), empty_dir(), dir_attrs()).unwrap();
+        tree.add_child(ROOT_ID, "b".into(), empty_dir(), dir_attrs()).unwrap();
+        tree.add_child(ROOT_ID, "f.txt".into(), file_kind("/x/f.txt"), dir_attrs())
+            .unwrap();
+        assert_eq!(subdir_count(&tree, ROOT_ID), 2);
+    }
+
+    #[test]
+    fn remove_recursive_decrements_subdir_count() {
+        let mut tree = Tree::new(0);
+        let a = tree.add_child(ROOT_ID, "a".into(), empty_dir(), dir_attrs()).unwrap();
+        tree.add_child(ROOT_ID, "b".into(), empty_dir(), dir_attrs()).unwrap();
+        assert_eq!(subdir_count(&tree, ROOT_ID), 2);
+        tree.remove_recursive(a);
+        assert_eq!(subdir_count(&tree, ROOT_ID), 1);
+        assert_eq!(tree.child(ROOT_ID, "a"), None);
+    }
+
+    #[test]
+    fn remove_recursive_does_not_recycle_node_ids() {
+        let mut tree = Tree::new(0);
+        let a = tree.add_child(ROOT_ID, "a".into(), empty_dir(), dir_attrs()).unwrap();
+        let len_before = tree.nodes.len();
+        tree.remove_recursive(a);
+        // Slot for `a` is now None but the Vec is unchanged in length —
+        // ids must remain stable for the process lifetime.
+        assert_eq!(tree.nodes.len(), len_before);
+        assert!(tree.nodes[a as usize].is_none());
+        let b = tree.add_child(ROOT_ID, "b".into(), empty_dir(), dir_attrs()).unwrap();
+        assert_ne!(a, b, "ids must not be recycled");
+        assert!(b > a);
+    }
+
+    #[test]
+    fn remove_recursive_clears_path_index_for_files() {
+        let mut tree = Tree::new(0);
+        let dir = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let file = tree
+            .add_child(dir, "f".into(), file_kind("/disk/f"), dir_attrs())
+            .unwrap();
+        tree.index_file(PathBuf::from("/disk/f"), file);
+        assert_eq!(tree.lookup_path(&PathBuf::from("/disk/f")), Some(file));
+        tree.remove_recursive(dir);
+        assert_eq!(tree.lookup_path(&PathBuf::from("/disk/f")), None);
+    }
+
+    #[test]
+    fn remove_recursive_root_is_noop() {
+        let mut tree = Tree::new(0);
+        let removed = tree.remove_recursive(ROOT_ID);
+        assert_eq!(removed, 0);
+        assert!(tree.get(ROOT_ID).is_some());
+    }
+
+    #[test]
+    fn finalize_sort_sorts_unsorted_dirs() {
+        let mut tree = Tree::new(0);
+        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        tree.mark_unsorted(d);
+        for n in ["c", "a", "b"] {
+            tree.add_child(d, n.into(), empty_dir(), dir_attrs()).unwrap();
+        }
+        // Before finalize, `sorted=false` so order reflects insertion.
+        assert_eq!(ordered_names(&tree, d), vec!["c", "a", "b"]);
+        tree.finalize_sort();
+        assert_eq!(ordered_names(&tree, d), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn add_child_into_sorted_dir_inserts_in_order() {
+        let mut tree = Tree::new(0);
+        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        // Default is sorted=true, so each insert must binary-search into place.
+        for n in ["c", "a", "b"] {
+            tree.add_child(d, n.into(), empty_dir(), dir_attrs()).unwrap();
+        }
+        assert_eq!(ordered_names(&tree, d), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn drop_dir_source_signals_emptiness_and_clears_path_index() {
+        let mut tree = Tree::new(0);
+        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let p1 = PathBuf::from("/m1/d");
+        let p2 = PathBuf::from("/m2/d");
+        tree.extend_dir_sources(d, p1.clone());
+        tree.extend_dir_sources(d, p2.clone());
+        assert_eq!(tree.lookup_path(&p1), Some(d));
+        assert!(!tree.drop_dir_source(d, &p1), "still has p2");
+        assert_eq!(tree.lookup_path(&p1), None);
+        assert!(tree.drop_dir_source(d, &p2), "now empty");
+        assert_eq!(tree.lookup_path(&p2), None);
+    }
+
+    #[test]
+    fn extend_dir_sources_promotes_synthetic_to_physical() {
+        let mut tree = Tree::new(0);
+        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        tree.extend_dir_sources(d, PathBuf::from("/m/d"));
+        match &tree.get(d).unwrap().kind {
+            NodeKind::Directory { sources: DirSources::Physical(v), .. } => {
+                assert_eq!(v.len(), 1);
+            }
+            _ => panic!("expected physical sources"),
+        }
+    }
+
+    #[test]
+    fn add_and_remove_bump_parent_mtime() {
+        let mut tree = Tree::new(0);
+        let d = tree.add_child(ROOT_ID, "d".into(), empty_dir(), dir_attrs()).unwrap();
+        let mtime0 = tree.get(d).unwrap().attrs.mtime;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let f = tree.add_child(d, "f".into(), file_kind("/x"), dir_attrs()).unwrap();
+        let mtime1 = tree.get(d).unwrap().attrs.mtime;
+        assert!(mtime1 > mtime0, "add_child must bump parent mtime");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        tree.remove_recursive(f);
+        let mtime2 = tree.get(d).unwrap().attrs.mtime;
+        assert!(mtime2 > mtime1, "remove_recursive must bump parent mtime");
+    }
+
+    #[test]
+    fn child_lookup_returns_none_for_missing_or_non_dir() {
+        let mut tree = Tree::new(0);
+        let f = tree
+            .add_child(ROOT_ID, "f".into(), file_kind("/x"), dir_attrs())
+            .unwrap();
+        assert_eq!(tree.child(ROOT_ID, "missing"), None);
+        // Looking up a child within a file node returns None.
+        assert_eq!(tree.child(f, "anything"), None);
     }
 }

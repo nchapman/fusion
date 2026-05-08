@@ -235,7 +235,7 @@ async fn drain(
                 match snap {
                     Some(s) => {
                         info!(root=%path.display(), virtual_id=vid, "applying snapshot");
-                        apply_snapshot(&mut tree_w, vid, &s, &config);
+                        apply_snapshot(&mut tree_w, vid, &s);
                     }
                     None => {
                         // Underlying path is gone — drop our source; if the

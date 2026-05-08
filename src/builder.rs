@@ -100,12 +100,7 @@ pub fn snapshot_dir(physical: &Path, config: &Config, depth: usize) -> Option<Di
 /// Apply a `DirSnapshot` to the in-memory tree. All work is in-memory — no
 /// disk I/O. Caller holds the write lock. Mirrors the diff logic that
 /// `rescan_dir` does inline, but without read_dir/metadata calls.
-pub fn apply_snapshot(
-    tree: &mut Tree,
-    virtual_id: NodeId,
-    snap: &DirSnapshot,
-    config: &Config,
-) {
+pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
     tree.extend_dir_sources(virtual_id, snap.physical.clone());
 
     // We only need the child ids to iterate; names + types come from
@@ -155,7 +150,7 @@ pub fn apply_snapshot(
                 }
                 match snap.children.get(&name) {
                     Some(EntrySnapshot::Dir(sub)) => {
-                        apply_snapshot(tree, *child_id, sub, config);
+                        apply_snapshot(tree, *child_id, sub);
                     }
                     _ => {
                         let now_empty = tree.drop_dir_source(*child_id, &child_phys);
@@ -181,7 +176,7 @@ pub fn apply_snapshot(
                     empty_dir_kind(),
                     sub.attrs.clone(),
                 ) {
-                    apply_snapshot(tree, child_id, sub, config);
+                    apply_snapshot(tree, child_id, sub);
                 }
             }
             EntrySnapshot::File { path, attrs } => {
@@ -204,12 +199,7 @@ pub fn apply_snapshot(
 /// it (recursive merge of subtrees). File-name collision: keep the existing
 /// (earlier) entry; log a warning unless the existing's backing is the same
 /// path (which means we're re-applying our own work).
-pub fn merge_snapshot(
-    tree: &mut Tree,
-    virtual_id: NodeId,
-    snap: &DirSnapshot,
-    config: &Config,
-) {
+pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
     tree.extend_dir_sources(virtual_id, snap.physical.clone());
     tree.mark_unsorted(virtual_id);
 
@@ -234,7 +224,7 @@ pub fn merge_snapshot(
                         None => continue,
                     }
                 };
-                merge_snapshot(tree, child_id, sub, config);
+                merge_snapshot(tree, child_id, sub);
             }
             EntrySnapshot::File { path, attrs } => {
                 let kind = NodeKind::File { backing: path.clone() };
@@ -289,6 +279,11 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
         label: String, // for logs
     }
     let mut jobs: Vec<ScanJob> = Vec::new();
+    // Per-share mount names. The doc'd contract is that a mount shadows any
+    // top-level merge entry of the same name (and the collision is logged).
+    // Without this set the recursive merge would descend into the mount's
+    // virtual dir and pollute it with files from the merge root.
+    let mut mount_names_per_share: HashMap<NodeId, HashSet<String>> = HashMap::new();
 
     for (share_name, share) in &config.shares {
         let share_id = tree
@@ -316,6 +311,10 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                     is_mount: true,
                     label: format!("{share_name}:mount:{mount_name}"),
                 });
+                mount_names_per_share
+                    .entry(share_id)
+                    .or_default()
+                    .insert(mount_name.clone());
             } else {
                 warn!(share=%share_name, mount=%mount_name, "mount name conflicts; skipping");
             }
@@ -364,11 +363,27 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     let (mounts, merges): (Vec<_>, Vec<_>) =
         snapshots.into_iter().partition(|(_, _, _, is_mount, _)| *is_mount);
 
-    for (vid, path, snap, _, label) in mounts.into_iter().chain(merges.into_iter()) {
+    for (vid, path, snap, is_mount, label) in mounts.into_iter().chain(merges.into_iter()) {
         match snap {
-            Some(s) => {
+            Some(mut s) => {
+                if !is_mount {
+                    if let Some(shadowed) = mount_names_per_share.get(&vid) {
+                        s.children.retain(|name, _| {
+                            if shadowed.contains(name) {
+                                warn!(
+                                    share_id = vid,
+                                    name = %name,
+                                    "merge entry shadowed by mount of same name"
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    }
+                }
                 info!(target=%label, root=%path.display(), "applying scan");
-                merge_snapshot(&mut tree, vid, &s, config);
+                merge_snapshot(&mut tree, vid, &s);
             }
             None => warn!(target=%label, path=%path.display(), "scan returned no data; skipping"),
         }
@@ -387,3 +402,350 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
 // `merge_snapshot`. The single-phase `rescan_path` is also gone — the
 // watcher uses `snapshot_dir` + `apply_snapshot` so disk I/O stays outside
 // the tree write lock.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Options, ServerConfig, ShareConfig};
+    use crate::tree::{NodeKind, ROOT_ID};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::File::create(path).unwrap();
+    }
+
+    fn cfg_for(shares: BTreeMap<String, ShareConfig>) -> Config {
+        Config {
+            server: ServerConfig::default(),
+            shares,
+            options: Options::default(),
+        }
+    }
+
+    fn cfg_with_options(shares: BTreeMap<String, ShareConfig>, options: Options) -> Config {
+        Config {
+            server: ServerConfig::default(),
+            shares,
+            options,
+        }
+    }
+
+    fn child_names(tree: &Tree, dir: NodeId) -> Vec<String> {
+        match &tree.get(dir).unwrap().kind {
+            NodeKind::Directory { ordered, .. } => {
+                ordered.iter().map(|(n, _)| n.clone()).collect()
+            }
+            _ => panic!("not a dir"),
+        }
+    }
+
+    fn file_backing(tree: &Tree, parent: NodeId, name: &str) -> PathBuf {
+        let id = tree.child(parent, name).expect("child exists");
+        match &tree.get(id).unwrap().kind {
+            NodeKind::File { backing } => backing.clone(),
+            _ => panic!("not a file"),
+        }
+    }
+
+    // ---------- snapshot_dir ----------
+
+    #[test]
+    fn snapshot_dir_returns_none_for_missing_path() {
+        let cfg = cfg_for(BTreeMap::new());
+        let snap = snapshot_dir(Path::new("/nonexistent/definitely/not/here"), &cfg, 0);
+        assert!(snap.is_none());
+    }
+
+    #[test]
+    fn snapshot_dir_captures_files_and_subdirs() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("a.mkv"));
+        touch(&dir.path().join("sub/b.mkv"));
+        let snap = snapshot_dir(dir.path(), &cfg_for(BTreeMap::new()), 0).unwrap();
+        assert!(snap.children.contains_key("a.mkv"));
+        match snap.children.get("sub").unwrap() {
+            EntrySnapshot::Dir(sub) => assert!(sub.children.contains_key("b.mkv")),
+            _ => panic!("sub should be a dir"),
+        }
+    }
+
+    #[test]
+    fn snapshot_dir_filters_dotfiles() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("Movie.mkv"));
+        touch(&dir.path().join(".DS_Store"));
+        let snap = snapshot_dir(dir.path(), &cfg_for(BTreeMap::new()), 0).unwrap();
+        assert!(snap.children.contains_key("Movie.mkv"));
+        assert!(!snap.children.contains_key(".DS_Store"));
+    }
+
+    #[test]
+    fn snapshot_dir_filters_hide_patterns() {
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("Movie.mkv"));
+        touch(&dir.path().join("Thumbs.db"));
+        let cfg = cfg_with_options(
+            BTreeMap::new(),
+            Options {
+                hide_dotfiles: true,
+                hide_patterns: vec!["thumbs.db".into()],
+                follow_symlinks: false,
+            },
+        );
+        let snap = snapshot_dir(dir.path(), &cfg, 0).unwrap();
+        assert!(snap.children.contains_key("Movie.mkv"));
+        assert!(!snap.children.contains_key("Thumbs.db"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_dir_skips_symlinks_when_follow_disabled() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("real.mkv"));
+        symlink("/etc/passwd", dir.path().join("evil")).unwrap();
+        let snap = snapshot_dir(dir.path(), &cfg_for(BTreeMap::new()), 0).unwrap();
+        assert!(snap.children.contains_key("real.mkv"));
+        assert!(
+            !snap.children.contains_key("evil"),
+            "symlink must be skipped when follow_symlinks=false"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_dir_follows_symlinks_when_enabled() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        touch(&target_dir.path().join("inside.mkv"));
+        symlink(target_dir.path(), dir.path().join("link")).unwrap();
+        let cfg = cfg_with_options(
+            BTreeMap::new(),
+            Options {
+                hide_dotfiles: true,
+                hide_patterns: vec![],
+                follow_symlinks: true,
+            },
+        );
+        let snap = snapshot_dir(dir.path(), &cfg, 0).unwrap();
+        match snap.children.get("link") {
+            Some(EntrySnapshot::Dir(sub)) => assert!(sub.children.contains_key("inside.mkv")),
+            _ => panic!("symlinked dir should appear as a Dir entry"),
+        }
+    }
+
+    // ---------- merge_snapshot (first-root-wins) ----------
+
+    #[test]
+    fn merge_snapshot_first_root_wins_on_file_conflict() {
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Movie.mkv"));
+        touch(&r2.path().join("Movie.mkv"));
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "Movies".into(),
+                NodeKind::Directory {
+                    by_name: FastMap::default(),
+                    ordered: Vec::new(),
+                    sorted: true,
+                    subdir_count: 0,
+                    sources: DirSources::Synthetic,
+                },
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+
+        let s1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
+        let s2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &s1);
+        merge_snapshot(&mut tree, share, &s2);
+        tree.finalize_sort();
+
+        let backing = file_backing(&tree, share, "Movie.mkv");
+        assert!(
+            backing.starts_with(r1.path()),
+            "first root must win: backing={}",
+            backing.display()
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_unions_directories_recursively() {
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Show/s1e1.mkv"));
+        touch(&r2.path().join("Show/s1e2.mkv"));
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "TV".into(),
+                NodeKind::Directory {
+                    by_name: FastMap::default(),
+                    ordered: Vec::new(),
+                    sorted: true,
+                    subdir_count: 0,
+                    sources: DirSources::Synthetic,
+                },
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+
+        let s1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
+        let s2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &s1);
+        merge_snapshot(&mut tree, share, &s2);
+        tree.finalize_sort();
+
+        let show = tree.child(share, "Show").expect("Show present");
+        let mut names = child_names(&tree, show);
+        names.sort();
+        assert_eq!(names, vec!["s1e1.mkv".to_string(), "s1e2.mkv".to_string()]);
+    }
+
+    // ---------- apply_snapshot (reconciling diff) ----------
+
+    #[test]
+    fn apply_snapshot_removes_deleted_files_and_adds_new_ones() {
+        let root = TempDir::new().unwrap();
+        touch(&root.path().join("keep.mkv"));
+        touch(&root.path().join("gone.mkv"));
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "Movies".into(),
+                NodeKind::Directory {
+                    by_name: FastMap::default(),
+                    ordered: Vec::new(),
+                    sorted: true,
+                    subdir_count: 0,
+                    sources: DirSources::Synthetic,
+                },
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &snap1);
+        tree.finalize_sort();
+        assert!(tree.child(share, "gone.mkv").is_some());
+
+        // Mutate disk: delete one, add another.
+        fs::remove_file(root.path().join("gone.mkv")).unwrap();
+        touch(&root.path().join("new.mkv"));
+        let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap2);
+
+        assert!(tree.child(share, "keep.mkv").is_some());
+        assert!(tree.child(share, "gone.mkv").is_none());
+        assert!(tree.child(share, "new.mkv").is_some());
+    }
+
+    // ---------- build() end-to-end ----------
+
+    #[test]
+    fn build_produces_share_with_merged_and_mounted_roots() {
+        let m1 = TempDir::new().unwrap();
+        let m2 = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+        touch(&m1.path().join("A.mkv"));
+        touch(&m2.path().join("B.mkv"));
+        touch(&archive.path().join("Old.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Movies".to_string(),
+            ShareConfig {
+                merge: vec![m1.path().to_path_buf(), m2.path().to_path_buf()],
+                mount: {
+                    let mut m = BTreeMap::new();
+                    m.insert("Archive".to_string(), archive.path().to_path_buf());
+                    m
+                },
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let movies = tree.child(ROOT_ID, "Movies").expect("Movies share");
+        let mut names = child_names(&tree, movies);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["A.mkv".to_string(), "Archive".to_string(), "B.mkv".to_string()]
+        );
+        let archive_id = tree.child(movies, "Archive").unwrap();
+        assert!(tree.child(archive_id, "Old.mkv").is_some());
+    }
+
+    #[test]
+    fn build_mount_takes_precedence_over_merge_with_same_name() {
+        // A merge root contains a directory called "Archive"; a mount also
+        // named "Archive" should win and the merge entry should be ignored.
+        let merge_root = TempDir::new().unwrap();
+        touch(&merge_root.path().join("Archive/from_merge.mkv"));
+        let mount_root = TempDir::new().unwrap();
+        touch(&mount_root.path().join("from_mount.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Movies".to_string(),
+            ShareConfig {
+                merge: vec![merge_root.path().to_path_buf()],
+                mount: {
+                    let mut m = BTreeMap::new();
+                    m.insert("Archive".to_string(), mount_root.path().to_path_buf());
+                    m
+                },
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let movies = tree.child(ROOT_ID, "Movies").unwrap();
+        let archive = tree.child(movies, "Archive").expect("mount Archive");
+        let names = child_names(&tree, archive);
+        assert!(
+            names.iter().any(|n| n == "from_mount.mkv"),
+            "mount content should be present: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "from_merge.mkv"),
+            "mount must shadow merge entry of same name: {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_skips_missing_merge_root_with_warning() {
+        let real = TempDir::new().unwrap();
+        touch(&real.path().join("real.mkv"));
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Movies".to_string(),
+            ShareConfig {
+                merge: vec![
+                    real.path().to_path_buf(),
+                    PathBuf::from("/definitely/not/here"),
+                ],
+                mount: BTreeMap::new(),
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build should succeed despite missing root");
+        let movies = tree.child(ROOT_ID, "Movies").unwrap();
+        assert!(tree.child(movies, "real.mkv").is_some());
+    }
+}

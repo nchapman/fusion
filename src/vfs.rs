@@ -343,3 +343,265 @@ fn io_to_nfs(e: &std::io::Error) -> nfsstat3 {
 // Suppress unused-import warning for types used only in trait bounds.
 #[allow(dead_code)]
 fn _types(_a: ftype3, _b: nfstime3, _c: specdata3) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{CachedAttrs, DirSources, FastMap, NodeKind, Tree};
+    use nfsserve::nfs::ftype3;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn empty_dir_kind() -> NodeKind {
+        NodeKind::Directory {
+            by_name: FastMap::default(),
+            ordered: Vec::new(),
+            sorted: true,
+            subdir_count: 0,
+            sources: DirSources::Synthetic,
+        }
+    }
+
+    fn fs_with(tree: Tree) -> FusionFs {
+        let server_id = tree.server_id;
+        FusionFs::new(Arc::new(RwLock::new(tree)), server_id, new_file_cache())
+    }
+
+    fn name(s: &str) -> filename3 {
+        filename3::from(s.as_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn root_dir_returns_root_id() {
+        let fs = fs_with(Tree::new(7));
+        assert_eq!(fs.root_dir(), ROOT_ID);
+    }
+
+    #[tokio::test]
+    async fn capabilities_is_read_only() {
+        let fs = fs_with(Tree::new(0));
+        assert!(matches!(fs.capabilities(), VFSCapabilities::ReadOnly));
+    }
+
+    #[tokio::test]
+    async fn lookup_dot_and_dotdot() {
+        let mut tree = Tree::new(0);
+        let child = tree
+            .add_child(ROOT_ID, "sub".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .unwrap();
+        let fs = fs_with(tree);
+
+        assert_eq!(fs.lookup(child, &name(".")).await.unwrap(), child);
+        assert_eq!(fs.lookup(child, &name("..")).await.unwrap(), ROOT_ID);
+        // Root's parent is root (RFC convention).
+        assert_eq!(fs.lookup(ROOT_ID, &name("..")).await.unwrap(), ROOT_ID);
+    }
+
+    #[tokio::test]
+    async fn lookup_missing_returns_noent() {
+        let fs = fs_with(Tree::new(0));
+        let err = fs.lookup(ROOT_ID, &name("nope")).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_NOENT));
+    }
+
+    #[tokio::test]
+    async fn lookup_on_stale_dirid_returns_stale() {
+        let fs = fs_with(Tree::new(0));
+        let err = fs.lookup(9999, &name(".")).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_STALE));
+    }
+
+    #[tokio::test]
+    async fn getattr_dir_nlink_is_two_plus_subdirs() {
+        let mut tree = Tree::new(0);
+        let parent = tree
+            .add_child(ROOT_ID, "p".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .unwrap();
+        for n in ["a", "b", "c"] {
+            tree.add_child(parent, n.into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+                .unwrap();
+        }
+        // Add a file too — must NOT count toward nlink.
+        tree.add_child(
+            parent,
+            "f".into(),
+            NodeKind::File { backing: PathBuf::from("/x") },
+            CachedAttrs::synthetic_dir(),
+        )
+        .unwrap();
+        let fs = fs_with(tree);
+        let attr = fs.getattr(parent).await.unwrap();
+        assert!(matches!(attr.ftype, ftype3::NF3DIR));
+        assert_eq!(attr.nlink, 2 + 3);
+    }
+
+    #[tokio::test]
+    async fn getattr_file_nlink_is_one() {
+        let mut tree = Tree::new(0);
+        let f = tree
+            .add_child(
+                ROOT_ID,
+                "f".into(),
+                NodeKind::File { backing: PathBuf::from("/x") },
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let fs = fs_with(tree);
+        let attr = fs.getattr(f).await.unwrap();
+        assert!(matches!(attr.ftype, ftype3::NF3REG));
+        assert_eq!(attr.nlink, 1);
+    }
+
+    #[tokio::test]
+    async fn readdir_paginates_with_node_id_cookies() {
+        let mut tree = Tree::new(0);
+        let mut ids = Vec::new();
+        for n in ["a", "b", "c", "d"] {
+            ids.push(
+                tree.add_child(ROOT_ID, n.into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+                    .unwrap(),
+            );
+        }
+        let fs = fs_with(tree);
+
+        let first = fs.readdir(ROOT_ID, 0, 2).await.unwrap();
+        assert_eq!(first.entries.len(), 2);
+        assert!(!first.end);
+        let last_cookie = first.entries.last().unwrap().fileid;
+
+        let second = fs.readdir(ROOT_ID, last_cookie, 10).await.unwrap();
+        assert_eq!(second.entries.len(), 2);
+        assert!(second.end);
+    }
+
+    #[tokio::test]
+    async fn readdir_returns_bad_cookie_for_stale_start_after() {
+        let mut tree = Tree::new(0);
+        let a = tree
+            .add_child(ROOT_ID, "a".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .unwrap();
+        tree.add_child(ROOT_ID, "b".into(), empty_dir_kind(), CachedAttrs::synthetic_dir())
+            .unwrap();
+        // Delete `a`. Its NodeId is now stale as a cookie.
+        tree.remove_recursive(a);
+        let fs = fs_with(tree);
+        let err = fs.readdir(ROOT_ID, a, 10).await.unwrap_err();
+        assert!(
+            matches!(err, nfsstat3::NFS3ERR_BAD_COOKIE),
+            "expected BAD_COOKIE; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn readdir_on_file_returns_notdir() {
+        let mut tree = Tree::new(0);
+        let f = tree
+            .add_child(
+                ROOT_ID,
+                "f".into(),
+                NodeKind::File { backing: PathBuf::from("/x") },
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let fs = fs_with(tree);
+        let err = fs.readdir(f, 0, 10).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_NOTDIR));
+    }
+
+    #[tokio::test]
+    async fn read_on_dir_returns_isdir() {
+        let fs = fs_with(Tree::new(0));
+        let err = fs.read(ROOT_ID, 0, 10).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_ISDIR));
+    }
+
+    #[tokio::test]
+    async fn read_returns_file_content_and_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let payload = b"hello fusion world";
+        std::fs::File::create(&path).unwrap().write_all(payload).unwrap();
+
+        let mut tree = Tree::new(0);
+        let mut attrs = CachedAttrs::synthetic_dir();
+        attrs.size = payload.len() as u64;
+        let fid = tree
+            .add_child(
+                ROOT_ID,
+                "data.bin".into(),
+                NodeKind::File { backing: path.clone() },
+                attrs,
+            )
+            .unwrap();
+        let fs = fs_with(tree);
+
+        let (buf, eof) = fs.read(fid, 0, 1024).await.unwrap();
+        assert_eq!(&buf, payload);
+        assert!(eof);
+
+        // Offset >= size: empty + EOF.
+        let (buf, eof) = fs.read(fid, payload.len() as u64, 1024).await.unwrap();
+        assert!(buf.is_empty());
+        assert!(eof);
+
+        // Partial read short of EOF.
+        let (buf, eof) = fs.read(fid, 0, 5).await.unwrap();
+        assert_eq!(&buf, &payload[..5]);
+        assert!(!eof);
+    }
+
+    #[tokio::test]
+    async fn readlink_is_unsupported() {
+        let fs = fs_with(Tree::new(0));
+        let err = fs.readlink(ROOT_ID).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_NOTSUPP));
+    }
+
+    #[tokio::test]
+    async fn all_mutating_ops_return_rofs() {
+        let fs = fs_with(Tree::new(0));
+        let n = name("x");
+        let blank_sattr = sattr3::default();
+
+        assert!(matches!(
+            fs.setattr(ROOT_ID, blank_sattr).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        assert!(matches!(
+            fs.write(ROOT_ID, 0, b"x").await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        assert!(matches!(
+            fs.create(ROOT_ID, &n, blank_sattr).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        assert!(matches!(
+            fs.create_exclusive(ROOT_ID, &n).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        assert!(matches!(
+            fs.mkdir(ROOT_ID, &n).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        assert!(matches!(
+            fs.remove(ROOT_ID, &n).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        assert!(matches!(
+            fs.rename(ROOT_ID, &n, ROOT_ID, &n).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+        let blank_path = nfspath3::from(b"/x".to_vec());
+        assert!(matches!(
+            fs.symlink(ROOT_ID, &n, &blank_path, &blank_sattr).await.unwrap_err(),
+            nfsstat3::NFS3ERR_ROFS
+        ));
+    }
+
+    #[tokio::test]
+    async fn serverid_matches_constructor_arg() {
+        let tree = Tree::new(0xdead_beef_cafe_babe);
+        let fs = fs_with(tree);
+        assert_eq!(fs.serverid(), 0xdead_beef_cafe_babe_u64.to_be_bytes());
+    }
+}
