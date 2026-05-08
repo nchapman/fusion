@@ -417,7 +417,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     // for first-root-wins on file conflicts.
     let (subdirs, merges): (Vec<_>, Vec<_>) = snapshots.into_iter().partition(|r| r.is_subdir);
 
-    for r in subdirs.into_iter().chain(merges.into_iter()) {
+    for r in subdirs.into_iter().chain(merges) {
         let ScanResult {
             target_id,
             physical,
