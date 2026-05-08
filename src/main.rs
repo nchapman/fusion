@@ -21,7 +21,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
-use crate::vfs::FusionFs;
+use crate::vfs::{new_file_cache, FusionFs};
 use crate::watcher::Watcher;
 
 #[derive(Parser)]
@@ -47,12 +47,23 @@ async fn main() -> Result<()> {
     let watch_roots = watcher::collect_roots(&config, &tree);
     let tree = Arc::new(RwLock::new(tree));
 
-    let _watcher = Watcher::start(config.clone(), tree.clone(), watch_roots)
-        .context("starting watcher")?;
+    let file_cache = new_file_cache();
+
+    let _watcher = Watcher::start(
+        config.clone(),
+        tree.clone(),
+        watch_roots,
+        file_cache.clone(),
+    )
+    .context("starting watcher")?;
 
     let bind = config.server.bind.clone();
     info!(%bind, "starting NFS server");
-    let listener = NFSTcpListener::bind(&bind, FusionFs::new(tree, server_id)).await?;
+    let listener = NFSTcpListener::bind(
+        &bind,
+        FusionFs::new(tree, server_id, file_cache),
+    )
+    .await?;
     listener.handle_forever().await?;
     Ok(())
 }

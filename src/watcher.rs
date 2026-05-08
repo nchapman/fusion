@@ -46,6 +46,7 @@ use tracing::{debug, error, info, warn};
 use crate::builder::{apply_snapshot, snapshot_dir, DirSnapshot};
 use crate::config::Config;
 use crate::tree::{NodeId, NodeKind, Tree, ROOT_ID};
+use crate::vfs::FileCache;
 
 const EVENT_CHANNEL_CAP: usize = 4096;
 
@@ -100,13 +101,14 @@ impl Watcher {
         config: Arc<Config>,
         tree: Arc<RwLock<Tree>>,
         roots: Vec<WatchRoot>,
+        file_cache: FileCache,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<WatchSignal>(EVENT_CHANNEL_CAP);
 
         // Capture runtime handle for the notify thread.
         let rt = Handle::current();
 
-        rt.spawn(drain(rx, config.clone(), tree.clone(), roots.clone()));
+        rt.spawn(drain(rx, config.clone(), tree.clone(), roots.clone(), file_cache));
 
         let tx_cb = tx.clone();
         let mut debouncer = new_debouncer(
@@ -171,6 +173,7 @@ async fn drain(
     config: Arc<Config>,
     tree: Arc<RwLock<Tree>>,
     roots: Vec<WatchRoot>,
+    file_cache: FileCache,
 ) {
     while let Some(first) = rx.recv().await {
         // 1. Coalesce queued signals.
@@ -247,6 +250,11 @@ async fn drain(
             }
             tree_w.finalize_sort();
         }
+
+        // Clear the file handle cache: any cached FD might point at a file
+        // whose path was just replaced or removed. Cache rebuild is cheap
+        // (one open per active stream); kernel page cache survives.
+        file_cache.lock().unwrap().clear();
     }
 }
 
