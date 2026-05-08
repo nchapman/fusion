@@ -43,6 +43,10 @@ harness = false
 name = "read"
 harness = false
 
+[[bench]]
+name = "contention"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
