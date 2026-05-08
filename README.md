@@ -6,12 +6,16 @@ LAN.
 
 ## Configure
 
-Copy `config.example.yaml` to `config.yaml` and edit. Each share has:
+The simplest config is one line per share:
 
-- `merge:` roots that union into the share root (first-root-wins on file
-  conflicts).
-- `mount:` roots that appear as named subdirectories (mount names shadow
-  same-named entries from merge roots).
+```yaml
+shares:
+  Movies: /mnt/movies
+  TV: /mnt/tv
+```
+
+A share value can be a single path, a list of paths (unioned), or the full
+form with `merge:` (unioned roots) and `subdirs:` (named subdirectories):
 
 ```yaml
 shares:
@@ -19,9 +23,12 @@ shares:
     merge:
       - /mnt/disk1/Movies
       - /mnt/disk2/Movies
-    mount:
+    subdirs:
       Archive: /mnt/archive/Movies
 ```
+
+Copy `config.example.yaml` (minimal) or `config.advanced.yaml` (every option
+documented) and edit.
 
 ## Run
 
@@ -31,15 +38,19 @@ cargo run --release -- --config config.yaml
 docker compose up --build
 ```
 
-Port 2049 is privileged on Linux. In dev, set `server.bind: 0.0.0.0:11111` in
-the config; in prod, give the binary `CAP_NET_BIND_SERVICE` or set
-`sysctl net.ipv4.ip_unprivileged_port_start=2049`.
+The default bind is `0.0.0.0:11111` (non-privileged). To expose port 2049 on
+Linux, give the binary `CAP_NET_BIND_SERVICE` or set
+`sysctl net.ipv4.ip_unprivileged_port_start=2049`, then set
+`server.bind: 0.0.0.0:2049` in the config.
 
-Mount from a client:
+Mount from a Linux client:
 
 ```bash
-mount -t nfs -o vers=3 fusion-host:/ /mnt/fusion
+mount -t nfs -o vers=3,port=11111,mountport=11111 fusion-host:/ /mnt/fusion
 ```
+
+Mount from macOS Finder: **Cmd-K → `nfs://fusion-host:11111/Movies`** (or use
+`mount_nfs -o vers=3,port=11111,mountport=11111 fusion-host:/Movies /mnt/m`).
 
 ## Develop
 

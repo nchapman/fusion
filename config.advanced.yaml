@@ -1,0 +1,56 @@
+# Full config with every option spelled out. Most users will never need
+# this — start from `config.example.yaml`.
+
+server:
+  # Default is 0.0.0.0:11111 (non-privileged). For production use 2049,
+  # but you'll need CAP_NET_BIND_SERVICE or sysctl
+  # net.ipv4.ip_unprivileged_port_start=2049 on Linux.
+  bind: 0.0.0.0:11111
+
+shares:
+  # Three accepted forms for a share:
+  #
+  #   Movies: /mnt/movies                     # one folder
+  #   Movies: [/mnt/d1/Movies, /mnt/d2/Movies]  # multiple folders, unioned
+  #   Movies: { merge: [...], subdirs: {...} }   # full form (this file)
+
+  Movies:
+    # `merge` roots union into the share root. First-root-wins on filename
+    # conflicts; directories with the same name merge recursively.
+    # Roots must not overlap (no root may be a parent of another).
+    merge:
+      - /mnt/disk1/Movies
+      - /mnt/disk2/Movies
+
+    # `subdirs` appear as named subdirectories of the share. No merging,
+    # no conflicts. If a subdir name collides with a top-level entry from
+    # a merge root, the subdir wins and the collision is logged.
+    subdirs:
+      Archive: /mnt/archive/Movies
+      4K: /mnt/disk3/Movies-4K
+
+  TV:
+    merge:
+      - /mnt/disk1/TV
+      - /mnt/disk2/TV
+
+options:
+  # Case-insensitive globs matched against directory entry names. Default
+  # hides dotfiles (`.*`), `Thumbs.db`, and `@eaDir`. Set to `[]` to show
+  # everything.
+  hide_patterns:
+    - ".*"
+    - "Thumbs.db"
+    - "@eaDir"
+    - "*.tmp"
+
+  # When false (default), symlinks in media roots are skipped — prevents
+  # an accidental symlink from exposing /etc/passwd over NFS. Set true
+  # if your library is built from symlink farms.
+  follow_symlinks: false
+
+  # Periodic full-rescan interval (humantime: "24h", "30m", "0s" to disable).
+  # Safety net behind notify in case events get dropped (kernel queue
+  # saturation, FUSE/SMB mounts that don't surface events, etc.). Default
+  # 24h — media disks usually spin down, and rescans wake them.
+  rescan_interval: 24h

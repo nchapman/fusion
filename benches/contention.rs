@@ -47,14 +47,10 @@ fn cfg() -> Config {
         "S".to_string(),
         ShareConfig {
             merge: vec![PathBuf::from("/unused")],
-            mount: BTreeMap::new(),
+            subdirs: BTreeMap::new(),
         },
     );
-    Config {
-        server: ServerConfig::default(),
-        shares,
-        options: Options::default(),
-    }
+    Config::from_parts(ServerConfig::default(), shares, Options::default()).expect("bench config")
 }
 
 struct BenchSetup {

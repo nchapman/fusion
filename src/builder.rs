@@ -137,8 +137,8 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
             NodeKind::File { backing } => {
                 // A file "belongs" to this snapshot only if its backing lives
                 // immediately inside `snap.physical`. `starts_with` alone
-                // would also match files in nested mount roots (e.g. a deeper
-                // mount whose path is a sub-path of this merge root), causing
+                // would also match files in nested subdir roots (e.g. a deeper
+                // subdir whose path is a sub-path of this merge root), causing
                 // their nodes to be incorrectly removed during this rescan.
                 if backing.parent() != Some(snap.physical.as_path()) {
                     // Another merge root owns this file. We deliberately
@@ -314,22 +314,22 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
 pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     let mut tree = Tree::new(server_id);
 
-    // Phase 1: lay out share + mount virtual nodes (sequential, RAM-only).
+    // Phase 1: lay out share + subdir virtual nodes (sequential, RAM-only).
     // We collect a flat job list of (target_virtual_id, physical_path,
-    // is_mount) so the disk-bound phase can fan out without touching the
+    // is_subdir) so the disk-bound phase can fan out without touching the
     // tree.
     struct ScanJob {
         target_id: NodeId,
         physical: PathBuf,
-        is_mount: bool,
+        is_subdir: bool,
         label: String, // for logs
     }
     let mut jobs: Vec<ScanJob> = Vec::new();
-    // Per-share mount names. The doc'd contract is that a mount shadows any
+    // Per-share subdir names. The doc'd contract is that a subdir shadows any
     // top-level merge entry of the same name (and the collision is logged).
-    // Without this set the recursive merge would descend into the mount's
+    // Without this set the recursive merge would descend into the subdir's
     // virtual dir and pollute it with files from the merge root.
-    let mut mount_names_per_share: HashMap<NodeId, HashSet<String>> = HashMap::new();
+    let mut subdir_names_per_share: HashMap<NodeId, HashSet<String>> = HashMap::new();
 
     for (share_name, share) in &config.shares {
         let share_id = tree
@@ -342,27 +342,27 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             .ok_or_else(|| anyhow::anyhow!("duplicate share name {share_name}"))?;
         info!(share = %share_name, id = share_id, "created share");
 
-        // Mounts get virtual node first so their names take precedence over
+        // Subdirs get a virtual node first so their names take precedence over
         // any same-named entries in merge roots.
-        for (mount_name, root) in &share.mount {
-            if let Some(mount_id) = tree.add_child(
+        for (subdir_name, root) in &share.subdirs {
+            if let Some(subdir_id) = tree.add_child(
                 share_id,
-                mount_name.clone(),
+                subdir_name.clone(),
                 NodeKind::empty_dir(),
                 CachedAttrs::synthetic_dir(),
             ) {
                 jobs.push(ScanJob {
-                    target_id: mount_id,
+                    target_id: subdir_id,
                     physical: root.clone(),
-                    is_mount: true,
-                    label: format!("{share_name}:mount:{mount_name}"),
+                    is_subdir: true,
+                    label: format!("{share_name}:subdir:{subdir_name}"),
                 });
-                mount_names_per_share
+                subdir_names_per_share
                     .entry(share_id)
                     .or_default()
-                    .insert(mount_name.clone());
+                    .insert(subdir_name.clone());
             } else {
-                warn!(share=%share_name, mount=%mount_name, "mount name conflicts; skipping");
+                warn!(share=%share_name, subdir=%subdir_name, "subdir name conflicts; skipping");
             }
         }
 
@@ -374,7 +374,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             jobs.push(ScanJob {
                 target_id: share_id,
                 physical: root.clone(),
-                is_mount: false,
+                is_subdir: false,
                 label: format!("{share_name}:merge:{}", root.display()),
             });
         }
@@ -387,7 +387,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
         target_id: NodeId,
         physical: PathBuf,
         snapshot: Option<DirSnapshot>,
-        is_mount: bool,
+        is_subdir: bool,
         label: String,
     }
     let scan_start = std::time::Instant::now();
@@ -400,7 +400,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                     target_id: j.target_id,
                     snapshot: snapshot_dir(&j.physical, cfg, 0),
                     physical: j.physical,
-                    is_mount: j.is_mount,
+                    is_subdir: j.is_subdir,
                     label: j.label,
                 })
             })
@@ -412,29 +412,29 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     });
     let scan_elapsed = scan_start.elapsed();
 
-    // Phase 3: apply snapshots sequentially. Mounts first (already won
+    // Phase 3: apply snapshots sequentially. Subdirs first (already won
     // their share-root slot in phase 1), then merge roots in config order
     // for first-root-wins on file conflicts.
-    let (mounts, merges): (Vec<_>, Vec<_>) = snapshots.into_iter().partition(|r| r.is_mount);
+    let (subdirs, merges): (Vec<_>, Vec<_>) = snapshots.into_iter().partition(|r| r.is_subdir);
 
-    for r in mounts.into_iter().chain(merges.into_iter()) {
+    for r in subdirs.into_iter().chain(merges.into_iter()) {
         let ScanResult {
             target_id,
             physical,
             snapshot,
-            is_mount,
+            is_subdir,
             label,
         } = r;
         match snapshot {
             Some(mut s) => {
-                if !is_mount {
-                    if let Some(shadowed) = mount_names_per_share.get(&target_id) {
+                if !is_subdir {
+                    if let Some(shadowed) = subdir_names_per_share.get(&target_id) {
                         s.children.retain(|name, _| {
                             if shadowed.contains(name) {
                                 warn!(
                                     share_id = target_id,
                                     name = %name,
-                                    "merge entry shadowed by mount of same name"
+                                    "merge entry shadowed by subdir of same name"
                                 );
                                 false
                             } else {
@@ -483,19 +483,11 @@ mod tests {
     }
 
     fn cfg_for(shares: BTreeMap<String, ShareConfig>) -> Config {
-        Config {
-            server: ServerConfig::default(),
-            shares,
-            options: Options::default(),
-        }
+        Config::from_parts(ServerConfig::default(), shares, Options::default()).unwrap()
     }
 
     fn cfg_with_options(shares: BTreeMap<String, ShareConfig>, options: Options) -> Config {
-        Config {
-            server: ServerConfig::default(),
-            shares,
-            options,
-        }
+        Config::from_parts(ServerConfig::default(), shares, options).unwrap()
     }
 
     fn child_names(tree: &Tree, dir: NodeId) -> Vec<String> {
@@ -739,7 +731,7 @@ mod tests {
     // ---------- build() end-to-end ----------
 
     #[test]
-    fn build_produces_share_with_merged_and_mounted_roots() {
+    fn build_produces_share_with_merged_and_subdir_roots() {
         let m1 = TempDir::new().unwrap();
         let m2 = TempDir::new().unwrap();
         let archive = TempDir::new().unwrap();
@@ -752,7 +744,7 @@ mod tests {
             "Movies".to_string(),
             ShareConfig {
                 merge: vec![m1.path().to_path_buf(), m2.path().to_path_buf()],
-                mount: {
+                subdirs: {
                     let mut m = BTreeMap::new();
                     m.insert("Archive".to_string(), archive.path().to_path_buf());
                     m
@@ -777,22 +769,22 @@ mod tests {
     }
 
     #[test]
-    fn build_mount_takes_precedence_over_merge_with_same_name() {
-        // A merge root contains a directory called "Archive"; a mount also
+    fn build_subdir_takes_precedence_over_merge_with_same_name() {
+        // A merge root contains a directory called "Archive"; a subdir also
         // named "Archive" should win and the merge entry should be ignored.
         let merge_root = TempDir::new().unwrap();
         touch(&merge_root.path().join("Archive/from_merge.mkv"));
-        let mount_root = TempDir::new().unwrap();
-        touch(&mount_root.path().join("from_mount.mkv"));
+        let subdir_root = TempDir::new().unwrap();
+        touch(&subdir_root.path().join("from_subdir.mkv"));
 
         let mut shares = BTreeMap::new();
         shares.insert(
             "Movies".to_string(),
             ShareConfig {
                 merge: vec![merge_root.path().to_path_buf()],
-                mount: {
+                subdirs: {
                     let mut m = BTreeMap::new();
-                    m.insert("Archive".to_string(), mount_root.path().to_path_buf());
+                    m.insert("Archive".to_string(), subdir_root.path().to_path_buf());
                     m
                 },
             },
@@ -800,11 +792,11 @@ mod tests {
         let cfg = cfg_for(shares);
         let tree = build(&cfg, 0).expect("build");
         let movies = tree.child(ROOT_ID, "Movies").unwrap();
-        let archive = tree.child(movies, "Archive").expect("mount Archive");
-        // Mount fully shadows the merge entry — only mount content is visible.
+        let archive = tree.child(movies, "Archive").expect("subdir Archive");
+        // Subdir fully shadows the merge entry — only subdir content is visible.
         assert_eq!(
             child_names(&tree, archive),
-            vec!["from_mount.mkv".to_string()]
+            vec!["from_subdir.mkv".to_string()]
         );
     }
 
@@ -985,7 +977,7 @@ mod tests {
                     real.path().to_path_buf(),
                     PathBuf::from("/definitely/not/here"),
                 ],
-                mount: BTreeMap::new(),
+                subdirs: BTreeMap::new(),
             },
         );
         let cfg = cfg_for(shares);

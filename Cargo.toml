@@ -20,6 +20,8 @@ rand = "0.8"
 ahash = "0.8"
 lru = "0.12"
 libc = "0.2"
+globset = "0.4"
+humantime-serde = "1"
 
 # jemalloc handles 1 MiB read buffers (per-RPC playback alloc) far better
 # than glibc malloc, which mmap/munmaps each. Not used on macOS where

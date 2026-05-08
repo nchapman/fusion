@@ -37,14 +37,10 @@ fn cfg_for(roots: Vec<PathBuf>) -> Config {
         "Media".to_string(),
         ShareConfig {
             merge: roots,
-            mount: BTreeMap::new(),
+            subdirs: BTreeMap::new(),
         },
     );
-    Config {
-        server: ServerConfig::default(),
-        shares,
-        options: Options::default(),
-    }
+    Config::from_parts(ServerConfig::default(), shares, Options::default()).expect("bench config")
 }
 
 fn bench_build(c: &mut Criterion) {

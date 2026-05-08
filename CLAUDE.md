@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`fusion` is a read-only NFSv3 server (built on `nfsserve` 0.11) that exposes a virtual filesystem composed of multiple physical media roots. It's designed for serving media libraries to clients like Infuse over NFS. There is no README; this file is the entry point.
+`fusion` is a read-only NFSv3 server (built on `nfsserve` 0.11) that exposes a virtual filesystem composed of multiple physical media roots. It's designed for serving media libraries to clients like Infuse over NFS. See `README.md` for user-facing setup; this file covers internals.
 
 ## Common commands
 
@@ -21,7 +21,7 @@ cargo bench                    # criterion benches: build, metadata, read, conte
 docker compose up --build      # uses host networking (NFS+macOS-Infuse compatibility)
 ```
 
-Port 2049 is privileged on Linux. Either bind a high port (`server.bind: 0.0.0.0:11111` in dev), grant `CAP_NET_BIND_SERVICE`, or set `sysctl net.ipv4.ip_unprivileged_port_start=2049`.
+Default bind is `0.0.0.0:11111` (non-privileged). Port 2049 is privileged on Linux: grant `CAP_NET_BIND_SERVICE` or set `sysctl net.ipv4.ip_unprivileged_port_start=2049` if you need it.
 
 `RUST_LOG` controls tracing (`info` default; `fusion=debug` is useful when diagnosing watcher/scan issues).
 
@@ -29,7 +29,7 @@ Port 2049 is privileged on Linux. Either bind a high port (`server.bind: 0.0.0.0
 
 Five modules in `src/`, all wired together in `main.rs`:
 
-- **`config.rs`** — YAML config: `shares` map of `{ merge: [paths], mount: { name: path } }`, plus `options` (hide patterns, `follow_symlinks`). Roots are canonicalized at load time so they match the paths reported by macOS FSEvents (`/private/...`).
+- **`config.rs`** — YAML config. A share value can be a single path, a list of paths (unioned), or `{ merge: [paths], subdirs: { name: path } }`. Plus `options`: `hide_patterns` (case-insensitive globs via `globset`, compiled once at load into `Config.hide_set`), `follow_symlinks`, `rescan_interval` (humantime, e.g. `"24h"`). Roots are canonicalized at load time so they match the paths reported by macOS FSEvents (`/private/...`); missing roots warn-but-don't-fail (disks come and go). Validation rejects overlapping merge roots within a share. Tests/benches construct via `Config::from_parts`; production must use `Config::load` (which is what compiles `hide_set`).
 - **`tree.rs`** — In-memory virtual filesystem. Flat `Vec<Option<Node>>` where the index *is* the NFS `fileid3`. **Index 0 is reserved (NFS forbids fileid 0); index 1 is always root.** NodeIds are never recycled — keeping them stable across mutations is what makes NFS readdir cookies remain valid. Directories track `subdir_count` (used for NFS `nlink = 2 + subdirs`; over-counting makes macOS `find` skip dirs). Two source kinds: `Synthetic` (root, share roots, intermediate union dirs) and `Physical(Vec<PathBuf>)` (one or more disk paths union into the same virtual dir).
 - **`builder.rs`** — Initial tree construction and the snapshot/apply primitives reused by the watcher.
   - `snapshot_dir` does pure disk I/O into a `DirSnapshot` (no tree access, safe in `spawn_blocking`).
@@ -48,5 +48,6 @@ Five modules in `src/`, all wired together in `main.rs`:
 - **`readdir` cookies are NodeIds.** When `start_after` no longer maps to a child (entry deleted between RPCs), return `NFS3ERR_BAD_COOKIE`, not `end:true` — Linux clients silently truncate listings on the latter.
 - **Bump parent `mtime` on add/remove.** Linux NFS uses parent dir mtime as the dentry-cache freshness key; without the bump, `ls` serves stale listings.
 - **`follow_symlinks: false` is the safe default.** A symlink inside a media root pointing at `/etc/passwd` would otherwise be served over NFS.
+- **`subdirs` was previously called `mount`.** Renamed because "mount" is what the *client* does in NFS-land — using it for a server-side concept is a perpetual source of confusion. Builder/watcher internals (`subdir_names_per_share`, `is_subdir`, log labels) follow the new name.
 - **macOS path canonicalization.** FSEvents reports paths under `/private/...`; the config loader canonicalizes roots at startup so `path_index` lookups match. Don't bypass `Config::load`.
 - **jemalloc** is the global allocator on non-Windows targets — glibc's mmap/munmap churn on per-RPC 1 MiB read buffers was a measurable hit. Don't remove without re-benchmarking.

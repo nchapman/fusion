@@ -24,7 +24,7 @@
 //! up once it regains capacity.
 //!
 //! Periodic rescan: a long-interval safety net (default 24h, configurable via
-//! `options.rescan_interval_secs`). Catches the cases notify can miss
+//! `options.rescan_interval`). Catches the cases notify can miss
 //! entirely — kernel-queue saturation that wasn't surfaced as `Flag::Rescan`,
 //! filesystems that don't generate events at all (some FUSE/SMB mounts), or
 //! events that fire before the watcher is fully attached.
@@ -101,11 +101,11 @@ pub fn collect_roots(config: &Config, tree: &Tree) -> Vec<WatchRoot> {
         let NodeKind::Directory { by_name, .. } = &share_node.kind else {
             continue;
         };
-        for (mount_name, r) in &share_cfg.mount {
-            if let Some(mount_id) = by_name.get(mount_name) {
+        for (subdir_name, r) in &share_cfg.subdirs {
+            if let Some(subdir_id) = by_name.get(subdir_name) {
                 out.push(WatchRoot {
                     physical: r.clone(),
-                    virtual_id: *mount_id,
+                    virtual_id: *subdir_id,
                 });
             }
         }
@@ -152,12 +152,12 @@ impl Watcher {
             file_cache,
         ));
 
-        // Optional periodic full-rescan task. `interval_secs == 0` disables.
-        let periodic = if config.options.rescan_interval_secs > 0 {
-            let interval_secs = config.options.rescan_interval_secs;
+        // Optional periodic full-rescan task. Zero duration disables.
+        let periodic = if !config.options.rescan_interval.is_zero() {
+            let interval = config.options.rescan_interval;
             let tx_periodic = tx.clone();
             let h = rt.spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+                let mut ticker = tokio::time::interval(interval);
                 // Default `Burst` would queue every missed tick during a stall
                 // (e.g. drainer backed up on `tx.send().await`) and fire them
                 // back-to-back on recovery — N consecutive full rescans for an
@@ -178,7 +178,7 @@ impl Watcher {
                     }
                 }
             });
-            info!(interval_secs, "periodic rescan enabled");
+            info!(?interval, "periodic rescan enabled");
             Some(h)
         } else {
             None
@@ -426,11 +426,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn cfg_with(shares: BTreeMap<String, ShareConfig>) -> Config {
-        Config {
-            server: ServerConfig::default(),
-            shares,
-            options: Options::default(),
-        }
+        Config::from_parts(ServerConfig::default(), shares, Options::default()).unwrap()
     }
 
     fn one_merge_share(name: &str, root: &Path) -> BTreeMap<String, ShareConfig> {
@@ -439,7 +435,7 @@ mod tests {
             name.to_string(),
             ShareConfig {
                 merge: vec![root.to_path_buf()],
-                mount: BTreeMap::new(),
+                subdirs: BTreeMap::new(),
             },
         );
         m
@@ -448,7 +444,7 @@ mod tests {
     // ---------- collect_roots ----------
 
     #[test]
-    fn collect_roots_returns_one_per_merge_and_mount() {
+    fn collect_roots_returns_one_per_merge_and_subdir() {
         let m1 = TempDir::new().unwrap();
         let m2 = TempDir::new().unwrap();
         let archive = TempDir::new().unwrap();
@@ -461,7 +457,7 @@ mod tests {
             "Movies".to_string(),
             ShareConfig {
                 merge: vec![m1.path().to_path_buf(), m2.path().to_path_buf()],
-                mount: {
+                subdirs: {
                     let mut m = BTreeMap::new();
                     m.insert("Archive".to_string(), archive.path().to_path_buf());
                     m
@@ -472,15 +468,15 @@ mod tests {
         let tree = build(&cfg, 0).unwrap();
 
         let roots = collect_roots(&cfg, &tree);
-        assert_eq!(roots.len(), 3, "two merge + one mount = 3 watch roots");
+        assert_eq!(roots.len(), 3, "two merge + one subdir = 3 watch roots");
 
         let physicals: Vec<_> = roots.iter().map(|r| r.physical.clone()).collect();
         assert!(physicals.contains(&m1.path().to_path_buf()));
         assert!(physicals.contains(&m2.path().to_path_buf()));
         assert!(physicals.contains(&archive.path().to_path_buf()));
 
-        // Mount root targets the mount node, not the share node — otherwise
-        // events on the mount would be applied at the share level.
+        // Subdir root targets the subdir node, not the share node — otherwise
+        // events on the subdir would be applied at the share level.
         let movies = tree.child(ROOT_ID, "Movies").unwrap();
         let archive_id = tree.child(movies, "Archive").unwrap();
         let archive_root = roots.iter().find(|r| r.physical == archive.path()).unwrap();
@@ -799,10 +795,10 @@ mod tests {
     /// pipeline is exercised, not just `drain` in isolation.
     async fn build_watcher_with_interval(
         m: &TempDir,
-        interval_secs: u64,
+        interval: Duration,
     ) -> (Arc<RwLock<Tree>>, Watcher) {
         let mut cfg_inner = cfg_with(one_merge_share("S", m.path()));
-        cfg_inner.options.rescan_interval_secs = interval_secs;
+        cfg_inner.options.rescan_interval = interval;
         let cfg = Arc::new(cfg_inner);
         let tree = Arc::new(RwLock::new(build(&cfg, 0).unwrap()));
         let roots = collect_roots(&cfg, &*tree.read().await);
@@ -819,7 +815,7 @@ mod tests {
         // tree within a few interval ticks.
         let m = TempDir::new().unwrap();
         let mut cfg_inner = cfg_with(one_merge_share("S", m.path()));
-        cfg_inner.options.rescan_interval_secs = 1;
+        cfg_inner.options.rescan_interval = Duration::from_secs(1);
         let cfg = Arc::new(cfg_inner);
         let tree = Arc::new(RwLock::new(build(&cfg, 0).unwrap()));
         let roots = collect_roots(&cfg, &*tree.read().await);
@@ -859,7 +855,7 @@ mod tests {
         // drainer task would leak. Drop must terminate cleanly without
         // hanging the test.
         let m = TempDir::new().unwrap();
-        let (_tree, watcher) = build_watcher_with_interval(&m, 1).await;
+        let (_tree, watcher) = build_watcher_with_interval(&m, Duration::from_secs(1)).await;
         // Implicit drop here is the test.
         drop(watcher);
         // If Drop deadlocked, the test runner would time out.
@@ -867,13 +863,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_with_zero_interval_does_not_spawn_periodic_task() {
-        // 0 disables the safety net. We can't easily inspect the task list,
-        // but if `rescan_interval_secs == 0` had erroneously spawned an
+        // Zero disables the safety net. We can't easily inspect the task list,
+        // but if a zero `rescan_interval` had erroneously spawned an
         // interval(0) ticker, that would either panic at construction or
         // burn CPU in a tight loop. Just constructing without panic is the
         // assertion.
         let m = TempDir::new().unwrap();
-        let (_tree, watcher) = build_watcher_with_interval(&m, 0).await;
+        let (_tree, watcher) = build_watcher_with_interval(&m, Duration::ZERO).await;
         drop(watcher);
     }
 }

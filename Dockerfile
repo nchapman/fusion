@@ -17,12 +17,11 @@ RUN apt-get update && \
     useradd -r -s /usr/sbin/nologin -u 1000 fusion
 COPY --from=builder /usr/local/bin/fusion /usr/local/bin/fusion
 
-# Default NFSv3 port. 2049 < 1024 is privileged on Linux; either run with
-# CAP_NET_BIND_SERVICE on the binary, use a higher port, or accept root.
-# We default to running as `fusion` and using port 2049 only when the
-# host kernel has been configured to allow it (e.g. sysctl
-# net.ipv4.ip_unprivileged_port_start=2049).
-EXPOSE 2049/tcp
+# Default bind is 0.0.0.0:11111 (non-privileged). For production NFS on
+# port 2049 you'll need CAP_NET_BIND_SERVICE on the binary or
+# `sysctl net.ipv4.ip_unprivileged_port_start=2049` on the host, plus
+# `server.bind: 0.0.0.0:2049` in the config.
+EXPOSE 11111/tcp
 
 ENV RUST_LOG=info
 USER fusion

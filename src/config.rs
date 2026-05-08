@@ -1,16 +1,25 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
+use tracing::warn;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(deserialize_with = "deserialize_shares")]
     pub shares: BTreeMap<String, ShareConfig>,
     #[serde(default)]
     pub options: Options,
+    /// Compiled `options.hide_patterns`. Built once at load. Use `is_hidden`
+    /// to query — the field is non-public so callers can't observe a `None`
+    /// state mid-construction.
+    #[serde(skip)]
+    hide_set: Option<GlobSet>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -28,60 +37,133 @@ impl Default for ServerConfig {
 }
 
 fn default_bind() -> String {
-    "0.0.0.0:2049".to_string()
+    // Non-privileged port so first-run doesn't EACCES on Linux. Production
+    // deployments that want 2049 set it explicitly (see README).
+    "0.0.0.0:11111".to_string()
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 pub struct ShareConfig {
     /// Roots that union into the share root.
-    #[serde(default)]
     pub merge: Vec<PathBuf>,
+    /// Roots that appear as named subdirectories of the share.
+    pub subdirs: BTreeMap<String, PathBuf>,
+}
 
-    /// Roots that mount as named subdirectories of the share.
-    #[serde(default)]
-    pub mount: BTreeMap<String, PathBuf>,
+/// User-facing share schema. Three forms accepted:
+///   `Movies: /mnt/movies`                   → single merge root
+///   `Movies: [/mnt/d1, /mnt/d2]`            → multiple merge roots
+///   `Movies: { merge: [...], subdirs: {…} }` → full form
+///
+/// `mount` is captured to produce a clear migration error — pre-rename
+/// configs would otherwise silently parse as an empty share.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ShareSpec {
+    Single(PathBuf),
+    Many(Vec<PathBuf>),
+    Full {
+        #[serde(default)]
+        merge: Vec<PathBuf>,
+        #[serde(default)]
+        subdirs: BTreeMap<String, PathBuf>,
+        #[serde(default, rename = "mount")]
+        mount_deprecated: Option<serde::de::IgnoredAny>,
+    },
+}
+
+impl ShareSpec {
+    fn into_config(self, share_name: &str) -> Result<ShareConfig> {
+        match self {
+            ShareSpec::Single(p) => Ok(ShareConfig {
+                merge: vec![p],
+                subdirs: BTreeMap::new(),
+            }),
+            ShareSpec::Many(v) => Ok(ShareConfig {
+                merge: v,
+                subdirs: BTreeMap::new(),
+            }),
+            ShareSpec::Full {
+                mount_deprecated: Some(_),
+                ..
+            } => anyhow::bail!(
+                "share {share_name}: `mount:` was renamed to `subdirs:`; \
+                 update your config (see config.advanced.yaml)"
+            ),
+            ShareSpec::Full { merge, subdirs, .. } => Ok(ShareConfig { merge, subdirs }),
+        }
+    }
+}
+
+fn deserialize_shares<'de, D>(d: D) -> std::result::Result<BTreeMap<String, ShareConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw: BTreeMap<String, ShareSpec> = BTreeMap::deserialize(d)?;
+    raw.into_iter()
+        .map(|(k, v)| {
+            v.into_config(&k)
+                .map(|cfg| (k, cfg))
+                .map_err(D::Error::custom)
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Options {
-    #[serde(default = "default_true")]
-    pub hide_dotfiles: bool,
-    #[serde(default)]
+    /// Globs (case-insensitive) matched against directory entry names. Default
+    /// hides dotfiles and a few platform metadata files. Set to `[]` to show
+    /// everything.
+    #[serde(default = "default_hide_patterns")]
     pub hide_patterns: Vec<String>,
     /// If true, scan follows symbolic links and exposes their targets as
     /// regular files. Off by default because a symlink inside a media root
     /// to e.g. `/etc/passwd` would otherwise be served over NFS.
     #[serde(default)]
     pub follow_symlinks: bool,
-    /// Periodic full rescan interval, in seconds. Safety net behind notify
-    /// in case events get dropped (kernel queue saturation, debouncer bugs,
-    /// FUSE/SMB mounts that don't surface events at all). 0 disables.
+    /// Periodic full rescan interval (e.g. `"24h"`, `"30m"`, `"0s"` to disable).
+    /// Safety net behind notify in case events get dropped.
     ///
-    /// Default 86400 (24h): media libraries change in clustered bursts and
-    /// usually live on disks that spin down — rescanning more often wakes
-    /// the disk for no benefit. Lower this if you're on flash and want
-    /// stronger correctness guarantees.
-    #[serde(default = "default_rescan_interval")]
-    pub rescan_interval_secs: u64,
+    /// Default 24h: media libraries change in clustered bursts and usually
+    /// live on disks that spin down — rescanning more often wakes the disk
+    /// for no benefit. Lower this if you're on flash and want stronger
+    /// correctness guarantees.
+    #[serde(default = "default_rescan_interval", with = "humantime_serde")]
+    pub rescan_interval: Duration,
+    /// Captures the pre-rename key so we can emit a guiding error rather than
+    /// silently using the default 24h. `deny_unknown_fields` would also reject
+    /// it, but with a generic "unknown field" message.
+    #[serde(default, rename = "rescan_interval_secs")]
+    pub(crate) rescan_interval_secs_deprecated: Option<serde::de::IgnoredAny>,
+    /// Pre-rename key — `hide_dotfiles` was folded into `hide_patterns`.
+    #[serde(default, rename = "hide_dotfiles")]
+    pub(crate) hide_dotfiles_deprecated: Option<serde::de::IgnoredAny>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            hide_dotfiles: true,
-            hide_patterns: Vec::new(),
+            hide_patterns: default_hide_patterns(),
             follow_symlinks: false,
-            rescan_interval_secs: default_rescan_interval(),
+            rescan_interval: default_rescan_interval(),
+            rescan_interval_secs_deprecated: None,
+            hide_dotfiles_deprecated: None,
         }
     }
 }
 
-fn default_rescan_interval() -> u64 {
-    86_400
+fn default_hide_patterns() -> Vec<String> {
+    vec![
+        ".*".to_string(), // dotfiles (.DS_Store, .AppleDouble, ...)
+        "Thumbs.db".to_string(),
+        "@eaDir".to_string(), // Synology metadata dirs
+    ]
 }
 
-fn default_true() -> bool {
-    true
+fn default_rescan_interval() -> Duration {
+    Duration::from_secs(86_400)
 }
 
 impl Config {
@@ -90,21 +172,36 @@ impl Config {
             .with_context(|| format!("reading config {}", path.display()))?;
         let mut cfg: Config = serde_yml::from_str(&text)
             .with_context(|| format!("parsing config {}", path.display()))?;
-        cfg.validate()?;
+        cfg.reject_deprecated_keys()?;
+        // Canonicalize before validate: overlap checks and absolute-path checks
+        // must run on resolved paths, not their pre-symlink-resolution form.
         cfg.canonicalize_roots();
-        // Pre-lowercase hide patterns so `is_hidden` (called once per
-        // directory entry on every scan) doesn't re-allocate per call.
-        for pat in &mut cfg.options.hide_patterns {
-            *pat = pat.to_lowercase();
-        }
+        cfg.validate()?;
+        cfg.warn_on_missing_roots();
+        cfg.hide_set = Some(build_hide_set(&cfg.options.hide_patterns)?);
         Ok(cfg)
+    }
+
+    fn reject_deprecated_keys(&self) -> Result<()> {
+        if self.options.rescan_interval_secs_deprecated.is_some() {
+            anyhow::bail!(
+                "`options.rescan_interval_secs` was renamed to `rescan_interval` \
+                 and now takes a humantime string (e.g. `\"24h\"`, `\"30m\"`, `\"0s\"`)"
+            );
+        }
+        if self.options.hide_dotfiles_deprecated.is_some() {
+            anyhow::bail!(
+                "`options.hide_dotfiles` was removed; dotfiles are hidden by the \
+                 default `hide_patterns: [\".*\"]`. Set `hide_patterns: []` to show them."
+            );
+        }
+        Ok(())
     }
 
     /// Resolve symlinks in every root path. macOS reports FSEvents under the
     /// real (e.g. /private/tmp) path, so unless we canonicalize at load time,
-    /// our `path_index` keys won't match the events we receive. We do this
-    /// once, eagerly — missing roots stay un-canonicalized and surface as
-    /// scan warnings later.
+    /// our `path_index` keys won't match the events we receive. Missing roots
+    /// stay un-canonicalized — they're surfaced by `warn_on_missing_roots`.
     fn canonicalize_roots(&mut self) {
         for share in self.shares.values_mut() {
             for p in share.merge.iter_mut() {
@@ -112,9 +209,38 @@ impl Config {
                     *p = c;
                 }
             }
-            for p in share.mount.values_mut() {
+            for p in share.subdirs.values_mut() {
                 if let Ok(c) = p.canonicalize() {
                     *p = c;
+                }
+            }
+        }
+    }
+
+    /// Loud-but-non-fatal warning for roots that don't exist on disk. A typo'd
+    /// path used to silently produce an empty share that "ran but showed
+    /// nothing"; this surfaces it. We don't `bail!` because disks legitimately
+    /// come and go (USB media, network mounts) and the watcher will pick up
+    /// the path when it appears.
+    fn warn_on_missing_roots(&self) {
+        for (name, share) in &self.shares {
+            for p in &share.merge {
+                if !p.exists() {
+                    warn!(
+                        share = %name,
+                        path = %p.display(),
+                        "merge root does not exist; share will be empty until path appears"
+                    );
+                }
+            }
+            for (sname, p) in &share.subdirs {
+                if !p.exists() {
+                    warn!(
+                        share = %name,
+                        subdir = %sname,
+                        path = %p.display(),
+                        "subdir root does not exist; subdir will be empty until path appears"
+                    );
                 }
             }
         }
@@ -128,23 +254,40 @@ impl Config {
             if !is_valid_path_segment(name) {
                 anyhow::bail!("invalid share name {name:?}");
             }
-            if share.merge.is_empty() && share.mount.is_empty() {
-                anyhow::bail!("share {name} has no merge or mount roots");
+            if share.merge.is_empty() && share.subdirs.is_empty() {
+                anyhow::bail!("share {name} has no merge or subdirs roots");
             }
             for p in &share.merge {
                 if !p.is_absolute() {
                     anyhow::bail!("share {name} merge root {} must be absolute", p.display());
                 }
             }
-            for (mname, p) in &share.mount {
-                if !is_valid_path_segment(mname) {
-                    anyhow::bail!("share {name} has invalid mount name {mname:?}");
+            for (sname, p) in &share.subdirs {
+                if !is_valid_path_segment(sname) {
+                    anyhow::bail!("share {name} has invalid subdir name {sname:?}");
                 }
                 if !p.is_absolute() {
                     anyhow::bail!(
-                        "share {name} mount {mname} root {} must be absolute",
+                        "share {name} subdir {sname} root {} must be absolute",
                         p.display()
                     );
+                }
+            }
+            // Reject overlapping merge roots within a share. The union is
+            // ambiguous (which root "wins" a file inside the overlap?) and the
+            // watcher would double-fire on every event under the inner path.
+            for (i, a) in share.merge.iter().enumerate() {
+                for b in share.merge.iter().skip(i + 1) {
+                    if a == b {
+                        anyhow::bail!("share {name} merge root {} listed twice", a.display());
+                    }
+                    if a.starts_with(b) || b.starts_with(a) {
+                        anyhow::bail!(
+                            "share {name} merge roots overlap: {} and {}",
+                            a.display(),
+                            b.display()
+                        );
+                    }
                 }
             }
         }
@@ -152,19 +295,28 @@ impl Config {
     }
 
     pub fn is_hidden(&self, name: &str) -> bool {
-        if self.options.hide_dotfiles && name.starts_with('.') {
-            return true;
-        }
-        // Patterns are simple case-insensitive substrings for v1.
-        // Patterns are pre-lowercased in `Config::load`.
-        let lower = name.to_lowercase();
-        for pat in &self.options.hide_patterns {
-            if lower.contains(pat) {
-                return true;
-            }
-        }
-        false
+        // `hide_set` is populated by `Config::load` / `from_parts`. A `None`
+        // here means a `Config` was built by some other path (e.g. raw serde
+        // deserialization in a future refactor) — better to fail loudly than
+        // silently expose entries that should have been hidden over NFS.
+        self.hide_set
+            .as_ref()
+            .expect("hide_set not built; construct Config via load() or from_parts()")
+            .is_match(name)
     }
+}
+
+fn build_hide_set(patterns: &[String]) -> Result<GlobSet> {
+    let mut b = GlobSetBuilder::new();
+    for pat in patterns {
+        let glob = GlobBuilder::new(pat)
+            .case_insensitive(true)
+            .literal_separator(true)
+            .build()
+            .with_context(|| format!("invalid hide pattern {pat:?}"))?;
+        b.add(glob);
+    }
+    b.build().context("building hide pattern set")
 }
 
 /// Names that become directory entries served over NFS. Reject empty,
@@ -174,22 +326,38 @@ fn is_valid_path_segment(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && s.trim() == s && !s.chars().any(|c| c.is_control())
 }
 
+impl Config {
+    /// Construct a `Config` directly, compiling the hide-pattern set. Used by
+    /// tests and benchmarks that bypass `Config::load`. Production code paths
+    /// should use `Config::load`. Returns `Err` if any hide pattern is an
+    /// invalid glob.
+    pub fn from_parts(
+        server: ServerConfig,
+        shares: BTreeMap<String, ShareConfig>,
+        options: Options,
+    ) -> Result<Self> {
+        let hide_set = build_hide_set(&options.hide_patterns)?;
+        Ok(Self {
+            server,
+            shares,
+            options,
+            hide_set: Some(hide_set),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cfg_with(shares: BTreeMap<String, ShareConfig>, options: Options) -> Config {
-        Config {
-            server: ServerConfig::default(),
-            shares,
-            options,
-        }
+        Config::from_parts(ServerConfig::default(), shares, options).expect("test config")
     }
 
-    fn share(merge: &[&str], mount: &[(&str, &str)]) -> ShareConfig {
+    fn share(merge: &[&str], subdirs: &[(&str, &str)]) -> ShareConfig {
         ShareConfig {
             merge: merge.iter().map(PathBuf::from).collect(),
-            mount: mount
+            subdirs: subdirs
                 .iter()
                 .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
                 .collect(),
@@ -203,20 +371,20 @@ mod tests {
     }
 
     #[test]
-    fn defaults_hide_dotfiles_and_skip_symlinks() {
+    fn defaults_skip_symlinks_and_hide_dotfiles_by_default() {
         let opts = Options::default();
-        assert!(opts.hide_dotfiles);
         assert!(!opts.follow_symlinks);
-        assert!(opts.hide_patterns.is_empty());
+        assert!(opts.hide_patterns.iter().any(|p| p == ".*"));
     }
 
     #[test]
-    fn default_bind_is_all_interfaces_2049() {
-        assert_eq!(ServerConfig::default().bind, "0.0.0.0:2049");
+    fn default_bind_is_unprivileged_port() {
+        // Default must be unprivileged so first-run doesn't fail with EACCES.
+        assert_eq!(ServerConfig::default().bind, "0.0.0.0:11111");
     }
 
     #[test]
-    fn is_hidden_dotfiles() {
+    fn is_hidden_dotfiles_by_default() {
         let cfg = cfg_with(BTreeMap::new(), Options::default());
         assert!(cfg.is_hidden(".DS_Store"));
         assert!(cfg.is_hidden(".hidden"));
@@ -224,11 +392,11 @@ mod tests {
     }
 
     #[test]
-    fn is_hidden_dotfiles_disabled() {
+    fn is_hidden_can_be_disabled_with_empty_patterns() {
         let cfg = cfg_with(
             BTreeMap::new(),
             Options {
-                hide_dotfiles: false,
+                hide_patterns: vec![],
                 ..Options::default()
             },
         );
@@ -236,20 +404,18 @@ mod tests {
     }
 
     #[test]
-    fn is_hidden_patterns_are_case_insensitive_substrings() {
+    fn is_hidden_globs_are_case_insensitive() {
         let cfg = cfg_with(
             BTreeMap::new(),
             Options {
-                hide_dotfiles: false,
-                // Patterns are pre-lowercased by `Config::load`; tests
-                // constructing `Config` directly must match that contract.
-                hide_patterns: vec!["thumbs.db".into(), "@eadir".into()],
+                hide_patterns: vec!["thumbs.db".into(), "@eaDir".into(), "*.tmp".into()],
                 ..Options::default()
             },
         );
         assert!(cfg.is_hidden("Thumbs.db"));
         assert!(cfg.is_hidden("THUMBS.DB"));
-        assert!(cfg.is_hidden("My@eadirCache"));
+        assert!(cfg.is_hidden("@eadir"));
+        assert!(cfg.is_hidden("scratch.tmp"));
         assert!(!cfg.is_hidden("Movie.mkv"));
     }
 
@@ -274,7 +440,7 @@ mod tests {
     #[test]
     fn validate_rejects_share_with_no_sources() {
         let cfg = cfg_with(one_share("Movies", share(&[], &[])), Options::default());
-        assert_validate_err(&cfg, "no merge or mount");
+        assert_validate_err(&cfg, "no merge or subdirs");
     }
 
     #[test]
@@ -293,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_relative_mount_root() {
+    fn validate_rejects_relative_subdir_root() {
         let cfg = cfg_with(
             one_share("Movies", share(&[], &[("Archive", "rel")])),
             Options::default(),
@@ -302,31 +468,155 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_mount_name_with_slash() {
+    fn validate_rejects_subdir_name_with_slash() {
         let cfg = cfg_with(
             one_share("Movies", share(&[], &[("a/b", "/m")])),
             Options::default(),
         );
-        assert_validate_err(&cfg, "invalid mount name");
+        assert_validate_err(&cfg, "invalid subdir name");
     }
 
     #[test]
-    fn validate_accepts_mount_only_share() {
+    fn validate_accepts_subdir_only_share() {
         let cfg = cfg_with(
             one_share("Movies", share(&[], &[("Archive", "/m")])),
             Options::default(),
         );
-        cfg.validate().expect("mount-only should be valid");
+        cfg.validate().expect("subdir-only should be valid");
     }
 
     #[test]
-    fn load_parses_yaml() {
+    fn validate_rejects_overlapping_merge_roots() {
+        // /a and /a/b within the same share would double-fire watcher events
+        // and have ambiguous union semantics.
+        let cfg = cfg_with(
+            one_share("Movies", share(&["/a", "/a/b"], &[])),
+            Options::default(),
+        );
+        assert_validate_err(&cfg, "overlap");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_merge_roots() {
+        let cfg = cfg_with(
+            one_share("Movies", share(&["/a", "/a"], &[])),
+            Options::default(),
+        );
+        assert_validate_err(&cfg, "twice");
+    }
+
+    #[test]
+    fn load_parses_minimal_yaml_with_string_shorthand() {
+        // The killer DX feature: one-line share config.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
-        std::fs::write(&path, "shares:\n  Movies:\n    merge:\n      - /tmp\n").unwrap();
+        std::fs::write(&path, "shares:\n  Movies: /tmp\n").unwrap();
         let cfg = Config::load(&path).expect("load");
-        assert!(cfg.shares.contains_key("Movies"));
-        assert_eq!(cfg.server.bind, "0.0.0.0:2049");
-        assert!(cfg.options.hide_dotfiles);
+        let movies = cfg.shares.get("Movies").expect("share Movies");
+        assert_eq!(movies.merge.len(), 1);
+        assert!(movies.subdirs.is_empty());
+    }
+
+    #[test]
+    fn load_parses_list_shorthand() {
+        let dir = tempfile::tempdir().unwrap();
+        let d1 = dir.path().join("d1");
+        let d2 = dir.path().join("d2");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "shares:\n  Movies:\n    - {}\n    - {}\n",
+                d1.display(),
+                d2.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert_eq!(cfg.shares["Movies"].merge.len(), 2);
+    }
+
+    #[test]
+    fn load_parses_full_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Movies:\n    merge:\n      - /tmp\n    subdirs:\n      Archive: /tmp\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert_eq!(cfg.shares["Movies"].merge.len(), 1);
+        assert!(cfg.shares["Movies"].subdirs.contains_key("Archive"));
+    }
+
+    #[test]
+    fn load_parses_humantime_rescan_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Movies: /tmp\noptions:\n  rescan_interval: 30m\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert_eq!(cfg.options.rescan_interval, Duration::from_secs(1800));
+    }
+
+    /// Pre-rename configs must fail with a guiding error, not silently parse
+    /// as an empty share / default interval.
+    fn assert_load_err(yaml: &str, needle: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let err = Config::load(&path).expect_err("expected load to fail");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains(&needle.to_lowercase()),
+            "error {msg:?} should mention {needle:?}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_deprecated_mount_key() {
+        assert_load_err(
+            "shares:\n  Movies:\n    mount:\n      Archive: /tmp\n",
+            "subdirs",
+        );
+    }
+
+    #[test]
+    fn load_rejects_deprecated_rescan_interval_secs_key() {
+        assert_load_err(
+            "shares:\n  Movies: /tmp\noptions:\n  rescan_interval_secs: 60\n",
+            "rescan_interval",
+        );
+    }
+
+    #[test]
+    fn load_rejects_deprecated_hide_dotfiles_key() {
+        assert_load_err(
+            "shares:\n  Movies: /tmp\noptions:\n  hide_dotfiles: false\n",
+            "hide_patterns",
+        );
+    }
+
+    #[test]
+    fn load_rejects_unknown_options_key() {
+        assert_load_err(
+            "shares:\n  Movies: /tmp\noptions:\n  totally_made_up: 1\n",
+            "unknown",
+        );
+    }
+
+    #[test]
+    fn load_default_bind_is_unprivileged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "shares:\n  Movies: /tmp\n").unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert_eq!(cfg.server.bind, "0.0.0.0:11111");
     }
 }
