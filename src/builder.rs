@@ -8,7 +8,7 @@ use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::tree::{CachedAttrs, DirSources, NodeKind, NodeId, Tree, ROOT_ID};
+use crate::tree::{CachedAttrs, DirSources, NodeId, NodeKind, Tree, ROOT_ID};
 
 /// Cap on recursive descent during scans. Protects against symlink loops
 /// when `follow_symlinks` is enabled.
@@ -80,7 +80,9 @@ pub fn snapshot_dir(physical: &Path, config: &Config, depth: usize) -> Option<Di
             continue;
         }
         let path = entry.path();
-        let Some(md) = stat_entry(&path, config) else { continue };
+        let Some(md) = stat_entry(&path, config) else {
+            continue;
+        };
         if md.is_dir() {
             if let Some(sub) = snapshot_dir(&path, config, depth + 1) {
                 children.insert(name, EntrySnapshot::Dir(Box::new(sub)));
@@ -115,19 +117,21 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
     // would burst thousands of String allocations under the write lock.
     let virtual_child_ids: Vec<NodeId> = match tree.get(virtual_id) {
         Some(node) => match &node.kind {
-            NodeKind::Directory { ordered, .. } => {
-                ordered.iter().map(|(_, id)| *id).collect()
-            }
+            NodeKind::Directory { ordered, .. } => ordered.iter().map(|(_, id)| *id).collect(),
             _ => return,
         },
         None => return,
     };
 
     let mut handled_names: HashSet<String> = HashSet::with_capacity(virtual_child_ids.len());
-    let mut parent_dirty = false;
+    // Tracks only the in-place attrs-changed case; add/remove paths bump the
+    // parent's mtime themselves inside `Tree::add_child` / `remove_recursive`.
+    let mut attrs_changed_in_place = false;
 
     for child_id in &virtual_child_ids {
-        let Some(child) = tree.get(*child_id) else { continue };
+        let Some(child) = tree.get(*child_id) else {
+            continue;
+        };
         let name = child.name.clone(); // single clone per child, not full Vec
         match &child.kind {
             NodeKind::File { backing } => {
@@ -137,25 +141,34 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 // mount whose path is a sub-path of this merge root), causing
                 // their nodes to be incorrectly removed during this rescan.
                 if backing.parent() != Some(snap.physical.as_path()) {
+                    // Another merge root owns this file. We deliberately
+                    // leave `name` out of `handled_names`: if the current
+                    // snap also has an entry by this name, the add-new pass
+                    // will hit `add_child`'s dup-name rejection (returns
+                    // `None`) and the cross-root file stays untouched.
                     continue;
                 }
-                handled_names.insert(name.clone());
                 match snap.children.get(&name) {
                     Some(EntrySnapshot::File { path, attrs }) if path == backing => {
+                        handled_names.insert(name.clone());
                         if let Some(node) = tree.get_mut(*child_id) {
                             // Patch attrs in place (size/mtime/etc may have
                             // changed). Bump the parent dir's mtime below so
                             // Linux NFS clients revalidate the dentry cache
                             // even for in-place file replacement.
-                            let attrs_changed = node.attrs.size != attrs.size
-                                || node.attrs.mtime != attrs.mtime;
+                            let attrs_changed =
+                                node.attrs.size != attrs.size || node.attrs.mtime != attrs.mtime;
                             node.attrs = attrs.clone();
                             if attrs_changed {
-                                parent_dirty = true;
+                                attrs_changed_in_place = true;
                             }
                         }
                     }
                     _ => {
+                        // The file is gone, OR the disk entry of this name is
+                        // now a directory (file→dir collision). Remove and
+                        // leave the name unhandled so the add-new pass below
+                        // can replace it with the new entry type.
                         info!(name=%name, backing=%backing.display(), "removing stale file node");
                         tree.remove_recursive(*child_id);
                     }
@@ -170,16 +183,26 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 if !backed_here {
                     continue;
                 }
-                handled_names.insert(name.clone());
                 match snap.children.get(&name) {
                     Some(EntrySnapshot::Dir(sub)) => {
+                        handled_names.insert(name.clone());
                         apply_snapshot(tree, *child_id, sub);
                     }
                     _ => {
+                        // Disk no longer has a directory at this name — drop
+                        // our source. If other physical roots still back this
+                        // virtual dir, it survives and shadows whatever new
+                        // entry the snap may have for this name (so we mark
+                        // it handled). If we were the last source, the dir
+                        // is removed and the name is left unhandled so the
+                        // add-new pass can install the replacement (handles
+                        // the dir→file collision case).
                         let now_empty = tree.drop_dir_source(*child_id, &child_phys);
                         if now_empty {
                             info!(name=%name, "removing stale directory node (no sources left)");
                             tree.remove_recursive(*child_id);
+                        } else {
+                            handled_names.insert(name.clone());
                         }
                     }
                 }
@@ -203,7 +226,9 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 }
             }
             EntrySnapshot::File { path, attrs } => {
-                let kind = NodeKind::File { backing: path.clone() };
+                let kind = NodeKind::File {
+                    backing: path.clone(),
+                };
                 if let Some(child_id) =
                     tree.add_child(virtual_id, name.clone(), kind, attrs.clone())
                 {
@@ -213,7 +238,7 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
         }
     }
 
-    if parent_dirty {
+    if attrs_changed_in_place {
         if let Some(node) = tree.get_mut(virtual_id) {
             let now = SystemTime::now();
             node.attrs.mtime = now;
@@ -240,7 +265,9 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 let existing = tree.child(virtual_id, name);
                 let child_id = if let Some(eid) = existing {
                     if !tree.get(eid).map(|n| n.is_dir()).unwrap_or(false) {
-                        warn!(name=%name, "directory shadowed by earlier file with same name");
+                        // First-root-wins: an earlier root already placed a
+                        // file at this name, so the incoming directory loses.
+                        warn!(name=%name, "incoming directory shadowed by earlier file with same name");
                         continue;
                     }
                     eid
@@ -258,7 +285,9 @@ pub fn merge_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 merge_snapshot(tree, child_id, sub);
             }
             EntrySnapshot::File { path, attrs } => {
-                let kind = NodeKind::File { backing: path.clone() };
+                let kind = NodeKind::File {
+                    backing: path.clone(),
+                };
                 if let Some(child_id) =
                     tree.add_child(virtual_id, name.clone(), kind, attrs.clone())
                 {
@@ -386,11 +415,16 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     // Phase 3: apply snapshots sequentially. Mounts first (already won
     // their share-root slot in phase 1), then merge roots in config order
     // for first-root-wins on file conflicts.
-    let (mounts, merges): (Vec<_>, Vec<_>) =
-        snapshots.into_iter().partition(|r| r.is_mount);
+    let (mounts, merges): (Vec<_>, Vec<_>) = snapshots.into_iter().partition(|r| r.is_mount);
 
     for r in mounts.into_iter().chain(merges.into_iter()) {
-        let ScanResult { target_id, physical, snapshot, is_mount, label } = r;
+        let ScanResult {
+            target_id,
+            physical,
+            snapshot,
+            is_mount,
+            label,
+        } = r;
         match snapshot {
             Some(mut s) => {
                 if !is_mount {
@@ -412,7 +446,9 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                 info!(target=%label, root=%physical.display(), "applying scan");
                 merge_snapshot(&mut tree, target_id, &s);
             }
-            None => warn!(target=%label, path=%physical.display(), "scan returned no data; skipping"),
+            None => {
+                warn!(target=%label, path=%physical.display(), "scan returned no data; skipping")
+            }
         }
     }
 
@@ -464,9 +500,7 @@ mod tests {
 
     fn child_names(tree: &Tree, dir: NodeId) -> Vec<String> {
         match &tree.get(dir).unwrap().kind {
-            NodeKind::Directory { ordered, .. } => {
-                ordered.iter().map(|(n, _)| n.clone()).collect()
-            }
+            NodeKind::Directory { ordered, .. } => ordered.iter().map(|(n, _)| n.clone()).collect(),
             _ => panic!("not a dir"),
         }
     }
@@ -519,9 +553,8 @@ mod tests {
         let cfg = cfg_with_options(
             BTreeMap::new(),
             Options {
-                hide_dotfiles: true,
                 hide_patterns: vec!["thumbs.db".into()],
-                follow_symlinks: false,
+                ..Options::default()
             },
         );
         let snap = snapshot_dir(dir.path(), &cfg, 0).unwrap();
@@ -555,9 +588,8 @@ mod tests {
         let cfg = cfg_with_options(
             BTreeMap::new(),
             Options {
-                hide_dotfiles: true,
-                hide_patterns: vec![],
                 follow_symlinks: true,
+                ..Options::default()
             },
         );
         let snap = snapshot_dir(dir.path(), &cfg, 0).unwrap();
@@ -687,17 +719,19 @@ mod tests {
         let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
         merge_snapshot(&mut tree, share, &snap1);
         tree.finalize_sort();
-        let mtime_before = tree.get(share).unwrap().attrs.mtime;
 
-        // Sleep a hair so filesystem mtime granularity definitely advances.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Backdate parent mtime to a sentinel; if apply_snapshot's
+        // attrs_changed_in_place branch fires it will overwrite this with
+        // `now()`. Size changes (`v1` → 17 bytes) guarantee `attrs_changed`
+        // is true, so we don't depend on filesystem mtime granularity.
+        tree.get_mut(share).unwrap().attrs.mtime = SystemTime::UNIX_EPOCH;
         std::fs::write(&path, b"v2-longer-content").unwrap();
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
         apply_snapshot(&mut tree, share, &snap2);
 
         let mtime_after = tree.get(share).unwrap().attrs.mtime;
         assert!(
-            mtime_after > mtime_before,
+            mtime_after > SystemTime::UNIX_EPOCH,
             "in-place file change must bump parent dir mtime"
         );
     }
@@ -732,7 +766,11 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["A.mkv".to_string(), "Archive".to_string(), "B.mkv".to_string()]
+            vec![
+                "A.mkv".to_string(),
+                "Archive".to_string(),
+                "B.mkv".to_string()
+            ]
         );
         let archive_id = tree.child(movies, "Archive").unwrap();
         assert!(tree.child(archive_id, "Old.mkv").is_some());
@@ -763,14 +801,175 @@ mod tests {
         let tree = build(&cfg, 0).expect("build");
         let movies = tree.child(ROOT_ID, "Movies").unwrap();
         let archive = tree.child(movies, "Archive").expect("mount Archive");
-        let names = child_names(&tree, archive);
+        // Mount fully shadows the merge entry — only mount content is visible.
+        assert_eq!(
+            child_names(&tree, archive),
+            vec!["from_mount.mkv".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_preserves_sorted_order_when_adding_entries() {
+        // The drainer relies on `apply_snapshot` keeping each touched
+        // directory's `sorted=true` invariant — `finalize_sort` is no longer
+        // called after a watcher batch. If `add_child`'s binary-search
+        // insertion regresses, this test catches it; readdir would return
+        // entries in insertion order instead of sorted order.
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("b.mkv"), b"").unwrap();
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "S".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &snap1);
+        tree.finalize_sort();
+
+        // Add three files that interleave alphabetically with the existing
+        // entry — `apply_snapshot` must binary-insert each one into place.
+        std::fs::write(root.path().join("a.mkv"), b"").unwrap();
+        std::fs::write(root.path().join("c.mkv"), b"").unwrap();
+        std::fs::write(root.path().join("aa.mkv"), b"").unwrap();
+        let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap2);
+
+        assert_eq!(
+            child_names(&tree, share),
+            vec![
+                "a.mkv".to_string(),
+                "aa.mkv".to_string(),
+                "b.mkv".to_string(),
+                "c.mkv".to_string(),
+            ],
+            "apply_snapshot must preserve sorted order on add"
+        );
+    }
+
+    #[test]
+    fn apply_snapshot_file_to_dir_collision_replaces_node() {
+        // A file `entry` becomes a directory `entry/` on disk between
+        // snapshots. The old file node must go and a directory node must
+        // appear in its place — within a single apply, not deferred to a
+        // later watcher tick.
+        let root = TempDir::new().unwrap();
+        let entry = root.path().join("entry");
+        std::fs::write(&entry, b"old").unwrap();
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "S".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &snap1);
+        tree.finalize_sort();
+
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::create_dir(&entry).unwrap();
+        std::fs::write(entry.join("inner.txt"), b"x").unwrap();
+
+        let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap2);
+
+        let entry_id = tree.child(share, "entry").expect("entry still present");
         assert!(
-            names.iter().any(|n| n == "from_mount.mkv"),
-            "mount content should be present: {names:?}"
+            tree.get(entry_id).unwrap().is_dir(),
+            "entry must now be a dir"
+        );
+        assert!(tree.child(entry_id, "inner.txt").is_some());
+    }
+
+    #[test]
+    fn apply_snapshot_dir_to_file_collision_replaces_node() {
+        // Inverse of the above: a directory becomes a regular file. The dir
+        // (and any descendants) must be removed and a file node must take
+        // its place.
+        let root = TempDir::new().unwrap();
+        let entry = root.path().join("entry");
+        std::fs::create_dir(&entry).unwrap();
+        std::fs::write(entry.join("inner.txt"), b"x").unwrap();
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "S".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &snap1);
+        tree.finalize_sort();
+
+        std::fs::remove_dir_all(&entry).unwrap();
+        std::fs::write(&entry, b"now a file").unwrap();
+
+        let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap2);
+
+        let entry_id = tree.child(share, "entry").expect("entry still present");
+        let node = tree.get(entry_id).unwrap();
+        assert!(!node.is_dir(), "entry must now be a file");
+        match &node.kind {
+            NodeKind::File { backing } => assert_eq!(backing, &entry),
+            _ => panic!("expected File"),
+        }
+    }
+
+    #[test]
+    fn apply_snapshot_does_not_remove_files_from_other_merge_roots() {
+        // Two merge roots union into one share. When we apply a snapshot of
+        // root1 alone, files contributed by root2 (whose backing path lives
+        // in root2, not root1) must NOT be removed: the `backing.parent()`
+        // ownership check at builder.rs:139 prevents a rescan of one root
+        // from clobbering another root's contributions.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        std::fs::write(r1.path().join("from_r1.mkv"), b"").unwrap();
+        std::fs::write(r2.path().join("from_r2.mkv"), b"").unwrap();
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "S".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        merge_snapshot(&mut tree, share, &snapshot_dir(r1.path(), &cfg, 0).unwrap());
+        merge_snapshot(&mut tree, share, &snapshot_dir(r2.path(), &cfg, 0).unwrap());
+        tree.finalize_sort();
+        assert!(tree.child(share, "from_r2.mkv").is_some());
+
+        // Re-snapshot r1 alone: from_r2.mkv is not in r1's snap.children.
+        // Without the parent() check, the apply loop would treat it as a
+        // stale file and call remove_recursive.
+        let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap_r1);
+
+        assert!(
+            tree.child(share, "from_r1.mkv").is_some(),
+            "r1 file should still be present after rescanning r1"
         );
         assert!(
-            !names.iter().any(|n| n == "from_merge.mkv"),
-            "mount must shadow merge entry of same name: {names:?}"
+            tree.child(share, "from_r2.mkv").is_some(),
+            "r2 file must not be removed by a rescan of r1"
         );
     }
 

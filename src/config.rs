@@ -21,7 +21,9 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { bind: default_bind() }
+        Self {
+            bind: default_bind(),
+        }
     }
 }
 
@@ -51,6 +53,16 @@ pub struct Options {
     /// to e.g. `/etc/passwd` would otherwise be served over NFS.
     #[serde(default)]
     pub follow_symlinks: bool,
+    /// Periodic full rescan interval, in seconds. Safety net behind notify
+    /// in case events get dropped (kernel queue saturation, debouncer bugs,
+    /// FUSE/SMB mounts that don't surface events at all). 0 disables.
+    ///
+    /// Default 86400 (24h): media libraries change in clustered bursts and
+    /// usually live on disks that spin down — rescanning more often wakes
+    /// the disk for no benefit. Lower this if you're on flash and want
+    /// stronger correctness guarantees.
+    #[serde(default = "default_rescan_interval")]
+    pub rescan_interval_secs: u64,
 }
 
 impl Default for Options {
@@ -59,8 +71,13 @@ impl Default for Options {
             hide_dotfiles: true,
             hide_patterns: Vec::new(),
             follow_symlinks: false,
+            rescan_interval_secs: default_rescan_interval(),
         }
     }
+}
+
+fn default_rescan_interval() -> u64 {
+    86_400
 }
 
 fn default_true() -> bool {
@@ -154,10 +171,7 @@ impl Config {
 /// path-component characters, control chars, and surrounding whitespace
 /// — all of which produce surprising client-side behaviour.
 fn is_valid_path_segment(s: &str) -> bool {
-    !s.is_empty()
-        && !s.contains('/')
-        && s.trim() == s
-        && !s.chars().any(|c| c.is_control())
+    !s.is_empty() && !s.contains('/') && s.trim() == s && !s.chars().any(|c| c.is_control())
 }
 
 #[cfg(test)]
@@ -213,7 +227,10 @@ mod tests {
     fn is_hidden_dotfiles_disabled() {
         let cfg = cfg_with(
             BTreeMap::new(),
-            Options { hide_dotfiles: false, ..Options::default() },
+            Options {
+                hide_dotfiles: false,
+                ..Options::default()
+            },
         );
         assert!(!cfg.is_hidden(".DS_Store"));
     }
@@ -227,7 +244,7 @@ mod tests {
                 // Patterns are pre-lowercased by `Config::load`; tests
                 // constructing `Config` directly must match that contract.
                 hide_patterns: vec!["thumbs.db".into(), "@eadir".into()],
-                follow_symlinks: false,
+                ..Options::default()
             },
         );
         assert!(cfg.is_hidden("Thumbs.db"));
@@ -236,25 +253,34 @@ mod tests {
         assert!(!cfg.is_hidden("Movie.mkv"));
     }
 
+    /// Assert `validate()` fails and the error message contains `needle`
+    /// (case-insensitive). Naming the specific constraint that fired prevents
+    /// a regression where the wrong rule rejects an input.
+    fn assert_validate_err(cfg: &Config, needle: &str) {
+        let err = cfg.validate().expect_err("expected validation error");
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains(&needle.to_lowercase()),
+            "error message {msg:?} should mention {needle:?}"
+        );
+    }
+
     #[test]
     fn validate_rejects_empty_shares_map() {
         let cfg = cfg_with(BTreeMap::new(), Options::default());
-        assert!(cfg.validate().is_err());
+        assert_validate_err(&cfg, "no shares");
     }
 
     #[test]
     fn validate_rejects_share_with_no_sources() {
         let cfg = cfg_with(one_share("Movies", share(&[], &[])), Options::default());
-        assert!(cfg.validate().is_err());
+        assert_validate_err(&cfg, "no merge or mount");
     }
 
     #[test]
     fn validate_rejects_share_name_with_slash() {
-        let cfg = cfg_with(
-            one_share("a/b", share(&["/m"], &[])),
-            Options::default(),
-        );
-        assert!(cfg.validate().is_err());
+        let cfg = cfg_with(one_share("a/b", share(&["/m"], &[])), Options::default());
+        assert_validate_err(&cfg, "invalid share name");
     }
 
     #[test]
@@ -263,8 +289,7 @@ mod tests {
             one_share("Movies", share(&["relative/path"], &[])),
             Options::default(),
         );
-        let err = cfg.validate().unwrap_err();
-        assert!(format!("{err}").contains("absolute"));
+        assert_validate_err(&cfg, "absolute");
     }
 
     #[test]
@@ -273,7 +298,7 @@ mod tests {
             one_share("Movies", share(&[], &[("Archive", "rel")])),
             Options::default(),
         );
-        assert!(cfg.validate().is_err());
+        assert_validate_err(&cfg, "absolute");
     }
 
     #[test]
@@ -282,7 +307,7 @@ mod tests {
             one_share("Movies", share(&[], &[("a/b", "/m")])),
             Options::default(),
         );
-        assert!(cfg.validate().is_err());
+        assert_validate_err(&cfg, "invalid mount name");
     }
 
     #[test]
@@ -298,11 +323,7 @@ mod tests {
     fn load_parses_yaml() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
-        std::fs::write(
-            &path,
-            "shares:\n  Movies:\n    merge:\n      - /tmp\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "shares:\n  Movies:\n    merge:\n      - /tmp\n").unwrap();
         let cfg = Config::load(&path).expect("load");
         assert!(cfg.shares.contains_key("Movies"));
         assert_eq!(cfg.server.bind, "0.0.0.0:2049");

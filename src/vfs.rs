@@ -67,7 +67,11 @@ pub struct FusionFs {
 
 impl FusionFs {
     pub fn new(tree: Arc<RwLock<Tree>>, server_id: u64, file_cache: FileCache) -> Self {
-        Self { tree, server_id, file_cache }
+        Self {
+            tree,
+            server_id,
+            file_cache,
+        }
     }
 
     /// Get a cached `File` or open it and cache it. The returned Arc is safe
@@ -79,7 +83,11 @@ impl FusionFs {
     /// We resolve by re-checking the cache after open and preferring the
     /// already-cached entry — the loser's `File` is dropped, closing its
     /// fd. Bounded to one duplicate per concurrent first-access burst.
-    fn open_cached(&self, id: NodeId, path: &std::path::Path) -> std::io::Result<Arc<std::fs::File>> {
+    fn open_cached(
+        &self,
+        id: NodeId,
+        path: &std::path::Path,
+    ) -> std::io::Result<Arc<std::fs::File>> {
         if let Some(f) = self.file_cache.lock().unwrap().get(&id).cloned() {
             return Ok(f);
         }
@@ -188,10 +196,7 @@ impl NFSFileSystem for FusionFs {
             while total < want {
                 let spare = buf.spare_capacity_mut();
                 let dst: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        spare.as_mut_ptr() as *mut u8,
-                        spare.len(),
-                    )
+                    std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
                 };
                 let n = file.read_at(dst, offset + total as u64)?;
                 if n == 0 {
@@ -258,7 +263,9 @@ impl NFSFileSystem for FusionFs {
             if entries.len() >= max_entries {
                 break;
             }
-            let Some(child) = tree.get(*child_id) else { continue };
+            let Some(child) = tree.get(*child_id) else {
+                continue;
+            };
             entries.push(DirEntry {
                 fileid: *child_id,
                 name: filename3::from(name.as_bytes().to_vec()),
@@ -354,6 +361,22 @@ mod tests {
         FusionFs::new(Arc::new(RwLock::new(tree)), server_id, new_file_cache())
     }
 
+    fn fs_with_cache(tree: Tree, cache: FileCache) -> FusionFs {
+        let server_id = tree.server_id;
+        FusionFs::new(Arc::new(RwLock::new(tree)), server_id, cache)
+    }
+
+    /// Add a real file to the tree backed by `path` with the given size.
+    fn add_file(tree: &mut Tree, name: &str, path: PathBuf, size: u64) -> NodeId {
+        tree.add_child(
+            ROOT_ID,
+            name.into(),
+            NodeKind::File { backing: path },
+            CachedAttrs::synthetic_file(size),
+        )
+        .unwrap()
+    }
+
     fn name(s: &str) -> filename3 {
         filename3::from(s.as_bytes().to_vec())
     }
@@ -374,7 +397,12 @@ mod tests {
     async fn lookup_dot_and_dotdot() {
         let mut tree = Tree::new(0);
         let child = tree
-            .add_child(ROOT_ID, "sub".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
+            .add_child(
+                ROOT_ID,
+                "sub".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
             .unwrap();
         let fs = fs_with(tree);
 
@@ -402,17 +430,29 @@ mod tests {
     async fn getattr_dir_nlink_is_two_plus_subdirs() {
         let mut tree = Tree::new(0);
         let parent = tree
-            .add_child(ROOT_ID, "p".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
+            .add_child(
+                ROOT_ID,
+                "p".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
             .unwrap();
         for n in ["a", "b", "c"] {
-            tree.add_child(parent, n.into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
-                .unwrap();
+            tree.add_child(
+                parent,
+                n.into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
         }
         // Add a file too — must NOT count toward nlink.
         tree.add_child(
             parent,
             "f".into(),
-            NodeKind::File { backing: PathBuf::from("/x") },
+            NodeKind::File {
+                backing: PathBuf::from("/x"),
+            },
             CachedAttrs::synthetic_dir(),
         )
         .unwrap();
@@ -429,8 +469,10 @@ mod tests {
             .add_child(
                 ROOT_ID,
                 "f".into(),
-                NodeKind::File { backing: PathBuf::from("/x") },
-                CachedAttrs::synthetic_dir(),
+                NodeKind::File {
+                    backing: PathBuf::from("/x"),
+                },
+                CachedAttrs::synthetic_file(0),
             )
             .unwrap();
         let fs = fs_with(tree);
@@ -442,22 +484,31 @@ mod tests {
     #[tokio::test]
     async fn readdir_paginates_with_node_id_cookies() {
         let mut tree = Tree::new(0);
-        let mut ids = Vec::new();
         for n in ["a", "b", "c", "d"] {
-            ids.push(
-                tree.add_child(ROOT_ID, n.into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
-                    .unwrap(),
-            );
+            tree.add_child(
+                ROOT_ID,
+                n.into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
         }
         let fs = fs_with(tree);
 
+        fn names(r: &ReadDirResult) -> Vec<String> {
+            r.entries
+                .iter()
+                .map(|e| std::str::from_utf8(e.name.as_ref()).unwrap().to_string())
+                .collect()
+        }
+
         let first = fs.readdir(ROOT_ID, 0, 2).await.unwrap();
-        assert_eq!(first.entries.len(), 2);
+        assert_eq!(names(&first), vec!["a", "b"]);
         assert!(!first.end);
         let last_cookie = first.entries.last().unwrap().fileid;
 
         let second = fs.readdir(ROOT_ID, last_cookie, 10).await.unwrap();
-        assert_eq!(second.entries.len(), 2);
+        assert_eq!(names(&second), vec!["c", "d"]);
         assert!(second.end);
     }
 
@@ -465,10 +516,20 @@ mod tests {
     async fn readdir_returns_bad_cookie_for_stale_start_after() {
         let mut tree = Tree::new(0);
         let a = tree
-            .add_child(ROOT_ID, "a".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
+            .add_child(
+                ROOT_ID,
+                "a".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
             .unwrap();
-        tree.add_child(ROOT_ID, "b".into(), NodeKind::empty_dir(), CachedAttrs::synthetic_dir())
-            .unwrap();
+        tree.add_child(
+            ROOT_ID,
+            "b".into(),
+            NodeKind::empty_dir(),
+            CachedAttrs::synthetic_dir(),
+        )
+        .unwrap();
         // Delete `a`. Its NodeId is now stale as a cookie.
         tree.remove_recursive(a);
         let fs = fs_with(tree);
@@ -486,7 +547,9 @@ mod tests {
             .add_child(
                 ROOT_ID,
                 "f".into(),
-                NodeKind::File { backing: PathBuf::from("/x") },
+                NodeKind::File {
+                    backing: PathBuf::from("/x"),
+                },
                 CachedAttrs::synthetic_dir(),
             )
             .unwrap();
@@ -507,7 +570,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data.bin");
         let payload = b"hello fusion world";
-        std::fs::File::create(&path).unwrap().write_all(payload).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(payload)
+            .unwrap();
 
         let mut tree = Tree::new(0);
         let mut attrs = CachedAttrs::synthetic_dir();
@@ -516,7 +582,9 @@ mod tests {
             .add_child(
                 ROOT_ID,
                 "data.bin".into(),
-                NodeKind::File { backing: path.clone() },
+                NodeKind::File {
+                    backing: path.clone(),
+                },
                 attrs,
             )
             .unwrap();
@@ -580,9 +648,160 @@ mod tests {
         ));
         let blank_path = nfspath3::from(b"/x".to_vec());
         assert!(matches!(
-            fs.symlink(ROOT_ID, &n, &blank_path, &blank_sattr).await.unwrap_err(),
+            fs.symlink(ROOT_ID, &n, &blank_path, &blank_sattr)
+                .await
+                .unwrap_err(),
             nfsstat3::NFS3ERR_ROFS
         ));
+    }
+
+    #[tokio::test]
+    async fn read_caps_count_at_one_mib() {
+        // Even if a client requests more than 1 MiB, we serve at most that
+        // per RPC. Build a 2 MiB file, ask for 4 MiB, verify capping.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let payload = vec![0xABu8; 2 * 1024 * 1024];
+        std::fs::write(&path, &payload).unwrap();
+
+        let mut tree = Tree::new(0);
+        let fid = add_file(&mut tree, "big.bin", path, payload.len() as u64);
+        let fs = fs_with(tree);
+
+        let (buf, eof) = fs.read(fid, 0, 4 * 1024 * 1024).await.unwrap();
+        assert_eq!(buf.len(), 1024 * 1024, "read must cap at 1 MiB");
+        assert!(!eof, "more data remains after the capped read");
+    }
+
+    #[tokio::test]
+    async fn read_concurrent_on_same_file_both_succeed() {
+        // pread is positional and we deliberately don't serialize concurrent
+        // readers of the same fd — Infuse playback often issues overlapping
+        // RPCs against the same file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.bin");
+        let payload: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+
+        let mut tree = Tree::new(0);
+        let fid = add_file(&mut tree, "concurrent.bin", path, payload.len() as u64);
+        let fs = Arc::new(fs_with(tree));
+
+        let (a, b) = tokio::join!(
+            {
+                let fs = fs.clone();
+                async move { fs.read(fid, 0, 1024).await }
+            },
+            {
+                let fs = fs.clone();
+                async move { fs.read(fid, 2048, 1024).await }
+            },
+        );
+        let (a_buf, _) = a.unwrap();
+        let (b_buf, _) = b.unwrap();
+        assert_eq!(a_buf, payload[..1024]);
+        assert_eq!(b_buf, payload[2048..3072]);
+    }
+
+    #[tokio::test]
+    async fn read_caches_open_fd_across_calls() {
+        // First read populates the cache; subsequent reads reuse the same
+        // entry. Without caching, sustained playback would pay open(2) per
+        // RPC — measurable on spinning disks.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cached.bin");
+        std::fs::write(&path, b"hello").unwrap();
+
+        let cache = new_file_cache();
+        let mut tree = Tree::new(0);
+        let fid = add_file(&mut tree, "cached.bin", path, 5);
+        let fs = fs_with_cache(tree, cache.clone());
+
+        assert_eq!(cache.lock().unwrap().len(), 0);
+        fs.read(fid, 0, 5).await.unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 1);
+        // Hit the same fid again — len should not grow.
+        fs.read(fid, 0, 5).await.unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_evicts_cache_entry_on_io_error() {
+        // If pread returns Err (e.g. backing file replaced under us), the
+        // stale fd must be evicted so the next read re-opens.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vanish.bin");
+        std::fs::write(&path, b"data").unwrap();
+
+        let cache = new_file_cache();
+        let mut tree = Tree::new(0);
+        // Cache the open fd via a successful first read.
+        let fid = add_file(&mut tree, "vanish.bin", path.clone(), 4096);
+        let fs = fs_with_cache(tree, cache.clone());
+        fs.read(fid, 0, 4).await.unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 1);
+
+        // Inject a bogus fd into the cache: open `/` (a directory), which
+        // makes `pread` fail with EISDIR. The next read for `fid` will use
+        // this entry, fail, and evict.
+        let bad = Arc::new(std::fs::File::open("/").unwrap());
+        cache.lock().unwrap().put(fid, bad);
+
+        let err = fs.read(fid, 0, 4).await.unwrap_err();
+        assert!(matches!(
+            err,
+            nfsstat3::NFS3ERR_IO | nfsstat3::NFS3ERR_ACCES
+        ));
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            0,
+            "bad fd must be evicted from cache after read error"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_cache_is_bounded_by_capacity() {
+        // The LRU drops the oldest entry once capacity is exceeded — without
+        // this, a long-running server with many briefly-touched files would
+        // leak fds.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = new_file_cache();
+        let mut tree = Tree::new(0);
+
+        // Capacity is 64; create 65 distinct files and read each once.
+        let mut fids = Vec::new();
+        for i in 0..65 {
+            let p = dir.path().join(format!("f{i}.bin"));
+            std::fs::write(&p, b"x").unwrap();
+            fids.push(add_file(&mut tree, &format!("f{i}.bin"), p, 1));
+        }
+        let fs = fs_with_cache(tree, cache.clone());
+
+        for fid in &fids {
+            fs.read(*fid, 0, 1).await.unwrap();
+        }
+
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            FILE_CACHE_CAP,
+            "cache must never exceed capacity"
+        );
+        // The first-touched fid is the LRU and must have been evicted by the
+        // 65th insertion.
+        assert!(
+            !cache.lock().unwrap().contains(&fids[0]),
+            "least-recently-used entry must have been evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_with_non_utf8_filename_returns_noent() {
+        // filename3 carries arbitrary bytes; we treat un-decodable bytes as
+        // "no such file" rather than 500-style errors.
+        let fs = fs_with(Tree::new(0));
+        let bad = filename3::from(vec![0xFFu8, 0xFE, 0xFD]);
+        let err = fs.lookup(ROOT_ID, &bad).await.unwrap_err();
+        assert!(matches!(err, nfsstat3::NFS3ERR_NOENT));
     }
 
     #[tokio::test]

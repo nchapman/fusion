@@ -14,7 +14,8 @@ cargo run -- --config config.yaml
 cargo check                    # fast type-check
 cargo clippy --all-targets -- -D warnings
 cargo fmt
-cargo test                     # (no tests currently in tree)
+cargo test                     # ~90 unit tests across all modules
+cargo bench                    # criterion benches: build, metadata, read, contention
 
 # Docker
 docker compose up --build      # uses host networking (NFS+macOS-Infuse compatibility)
