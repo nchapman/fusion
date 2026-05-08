@@ -34,8 +34,13 @@ documented) and edit.
 
 ```bash
 cargo run --release -- --config config.yaml
-# or
+# or build the container locally
 docker compose up --build
+# or pull the prebuilt multi-arch image (amd64 / arm64)
+docker run --rm --network host \
+  -v "$PWD/config.yaml":/etc/fusion/config.yaml:ro \
+  -v /mnt:/mnt:ro \
+  ghcr.io/nchapman/fusion:latest
 ```
 
 The default bind is `0.0.0.0:11111` (non-privileged). To expose port 2049 on
