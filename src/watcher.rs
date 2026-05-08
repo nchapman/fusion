@@ -26,8 +26,9 @@
 //! v1; documented as a known limit.)
 //!
 //! Overflow handling: notify reports queue overflows differently per-OS.
-//! On macOS FSEvents the kernel sets `Flag::MustScanSubDirs` inside an `Ok`
-//! event; on Linux inotify it surfaces as `Err`. Both routes emit a
+//! On macOS FSEvents the kernel sets `Flag::Rescan` inside an `Ok` event
+//! (the underlying FSEvents flag is `kFSEventStreamEventFlagMustScanSubDirs`);
+//! on Linux inotify it surfaces as `Err`. Both routes emit a
 //! `WatchSignal::RescanAll` to force re-snapshot of every root.
 
 use std::collections::HashSet;
@@ -133,14 +134,18 @@ impl Watcher {
                         let _ = tx_cb.try_send(WatchSignal::RescanAll);
                         return;
                     }
+                    let mut dropped = 0usize;
                     for path in paths {
-                        if let Err(e) = tx_cb.try_send(WatchSignal::Path(path)) {
-                            // Channel is full — log and drop. The reconciliatory
-                            // model means we'll catch up on the next event or
-                            // rescan; nothing is silently lost permanently.
-                            warn!(error=?e, "watcher channel full; dropping event");
-                            break;
+                        if tx_cb.try_send(WatchSignal::Path(path)).is_err() {
+                            dropped += 1;
                         }
+                    }
+                    if dropped > 0 {
+                        // Channel saturated. Convert silent loss into a
+                        // guaranteed catch-up: send RescanAll so the drainer
+                        // picks up everything once it regains capacity.
+                        warn!(dropped, "watcher channel full; scheduling full rescan");
+                        let _ = tx_cb.try_send(WatchSignal::RescanAll);
                     }
                 }
                 Err(errors) => {
@@ -216,7 +221,7 @@ async fn drain(
         // 3. Phase 1 — snapshot each dirty root on a blocking thread, no lock.
         let cfg_b = config.clone();
         let snapshots: Vec<(PathBuf, NodeId, Option<DirSnapshot>)> =
-            tokio::task::spawn_blocking(move || {
+            match tokio::task::spawn_blocking(move || {
                 dirty
                     .into_iter()
                     .map(|(path, vid)| {
@@ -226,7 +231,15 @@ async fn drain(
                     .collect()
             })
             .await
-            .unwrap_or_default();
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // A panic inside snapshot_dir would otherwise drop the
+                    // dirty batch silently, leaving the tree stale forever.
+                    error!(error=?e, "snapshot worker panicked; dropping batch");
+                    continue;
+                }
+            };
 
         // 4. Phase 2 — apply under write lock briefly.
         {

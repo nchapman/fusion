@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
@@ -103,6 +104,12 @@ pub fn snapshot_dir(physical: &Path, config: &Config, depth: usize) -> Option<Di
 pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
     tree.extend_dir_sources(virtual_id, snap.physical.clone());
 
+    // Refresh the virtual dir's own attrs so getattr reflects the latest
+    // on-disk mtime/ctime (clients use this as a dentry-cache freshness key).
+    if let Some(node) = tree.get_mut(virtual_id) {
+        node.attrs = snap.attrs.clone();
+    }
+
     // We only need the child ids to iterate; names + types come from
     // `tree.get(child_id)` per-step. Cloning the (String, NodeId) Vec
     // would burst thousands of String allocations under the write lock.
@@ -117,20 +124,35 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
     };
 
     let mut handled_names: HashSet<String> = HashSet::with_capacity(virtual_child_ids.len());
+    let mut parent_dirty = false;
 
     for child_id in &virtual_child_ids {
         let Some(child) = tree.get(*child_id) else { continue };
         let name = child.name.clone(); // single clone per child, not full Vec
-        handled_names.insert(name.clone());
         match &child.kind {
             NodeKind::File { backing } => {
-                if !backing.starts_with(&snap.physical) {
+                // A file "belongs" to this snapshot only if its backing lives
+                // immediately inside `snap.physical`. `starts_with` alone
+                // would also match files in nested mount roots (e.g. a deeper
+                // mount whose path is a sub-path of this merge root), causing
+                // their nodes to be incorrectly removed during this rescan.
+                if backing.parent() != Some(snap.physical.as_path()) {
                     continue;
                 }
+                handled_names.insert(name.clone());
                 match snap.children.get(&name) {
                     Some(EntrySnapshot::File { path, attrs }) if path == backing => {
                         if let Some(node) = tree.get_mut(*child_id) {
+                            // Patch attrs in place (size/mtime/etc may have
+                            // changed). Bump the parent dir's mtime below so
+                            // Linux NFS clients revalidate the dentry cache
+                            // even for in-place file replacement.
+                            let attrs_changed = node.attrs.size != attrs.size
+                                || node.attrs.mtime != attrs.mtime;
                             node.attrs = attrs.clone();
+                            if attrs_changed {
+                                parent_dirty = true;
+                            }
                         }
                     }
                     _ => {
@@ -148,6 +170,7 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                 if !backed_here {
                     continue;
                 }
+                handled_names.insert(name.clone());
                 match snap.children.get(&name) {
                     Some(EntrySnapshot::Dir(sub)) => {
                         apply_snapshot(tree, *child_id, sub);
@@ -187,6 +210,14 @@ pub fn apply_snapshot(tree: &mut Tree, virtual_id: NodeId, snap: &DirSnapshot) {
                     tree.index_file(path.clone(), child_id);
                 }
             }
+        }
+    }
+
+    if parent_dirty {
+        if let Some(node) = tree.get_mut(virtual_id) {
+            let now = SystemTime::now();
+            node.attrs.mtime = now;
+            node.attrs.ctime = now;
         }
     }
 }
@@ -323,41 +354,51 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
     // Phase 2: snapshot every root in parallel. Each worker only needs
     // `&Config` and the physical path; no tree access, no lock. On spinning
     // disks this gives ≈N_disks speedup over the previous serial scan.
+    struct ScanResult {
+        target_id: NodeId,
+        physical: PathBuf,
+        snapshot: Option<DirSnapshot>,
+        is_mount: bool,
+        label: String,
+    }
     let scan_start = std::time::Instant::now();
-    let snapshots: Vec<(NodeId, PathBuf, Option<DirSnapshot>, bool, String)> =
-        std::thread::scope(|s| {
-            let cfg = config;
-            let handles: Vec<_> = jobs
-                .into_iter()
-                .map(|j| {
-                    s.spawn(move || {
-                        let snap = snapshot_dir(&j.physical, cfg, 0);
-                        (j.target_id, j.physical, snap, j.is_mount, j.label)
-                    })
+    let snapshots: Vec<ScanResult> = std::thread::scope(|s| {
+        let cfg = config;
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|j| {
+                s.spawn(move || ScanResult {
+                    target_id: j.target_id,
+                    snapshot: snapshot_dir(&j.physical, cfg, 0),
+                    physical: j.physical,
+                    is_mount: j.is_mount,
+                    label: j.label,
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("scan worker panicked"))
-                .collect()
-        });
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("scan worker panicked"))
+            .collect()
+    });
     let scan_elapsed = scan_start.elapsed();
 
     // Phase 3: apply snapshots sequentially. Mounts first (already won
     // their share-root slot in phase 1), then merge roots in config order
     // for first-root-wins on file conflicts.
     let (mounts, merges): (Vec<_>, Vec<_>) =
-        snapshots.into_iter().partition(|(_, _, _, is_mount, _)| *is_mount);
+        snapshots.into_iter().partition(|r| r.is_mount);
 
-    for (vid, path, snap, is_mount, label) in mounts.into_iter().chain(merges.into_iter()) {
-        match snap {
+    for r in mounts.into_iter().chain(merges.into_iter()) {
+        let ScanResult { target_id, physical, snapshot, is_mount, label } = r;
+        match snapshot {
             Some(mut s) => {
                 if !is_mount {
-                    if let Some(shadowed) = mount_names_per_share.get(&vid) {
+                    if let Some(shadowed) = mount_names_per_share.get(&target_id) {
                         s.children.retain(|name, _| {
                             if shadowed.contains(name) {
                                 warn!(
-                                    share_id = vid,
+                                    share_id = target_id,
                                     name = %name,
                                     "merge entry shadowed by mount of same name"
                                 );
@@ -368,10 +409,10 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                         });
                     }
                 }
-                info!(target=%label, root=%path.display(), "applying scan");
-                merge_snapshot(&mut tree, vid, &s);
+                info!(target=%label, root=%physical.display(), "applying scan");
+                merge_snapshot(&mut tree, target_id, &s);
             }
-            None => warn!(target=%label, path=%path.display(), "scan returned no data; skipping"),
+            None => warn!(target=%label, path=%physical.display(), "scan returned no data; skipping"),
         }
     }
 
@@ -622,6 +663,43 @@ mod tests {
         assert!(tree.child(share, "keep.mkv").is_some());
         assert!(tree.child(share, "gone.mkv").is_none());
         assert!(tree.child(share, "new.mkv").is_some());
+    }
+
+    #[test]
+    fn apply_snapshot_in_place_file_change_bumps_parent_mtime() {
+        // Linux NFS uses parent dir mtime as the dentry-cache freshness
+        // key. If a file is overwritten in place (size or mtime change with
+        // no name add/remove), the parent must still be marked dirty.
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("Movie.mkv");
+        std::fs::write(&path, b"v1").unwrap();
+
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "Movies".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        let snap1 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        merge_snapshot(&mut tree, share, &snap1);
+        tree.finalize_sort();
+        let mtime_before = tree.get(share).unwrap().attrs.mtime;
+
+        // Sleep a hair so filesystem mtime granularity definitely advances.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"v2-longer-content").unwrap();
+        let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
+        apply_snapshot(&mut tree, share, &snap2);
+
+        let mtime_after = tree.get(share).unwrap().attrs.mtime;
+        assert!(
+            mtime_after > mtime_before,
+            "in-place file change must bump parent dir mtime"
+        );
     }
 
     // ---------- build() end-to-end ----------

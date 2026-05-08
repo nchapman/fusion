@@ -41,21 +41,19 @@ fn to_nfstime(t: SystemTime) -> nfstime3 {
 }
 
 pub fn fattr3_for(node: &Node, server_id: u64) -> fattr3 {
-    let (ftype, mode_default, nlink) = match &node.kind {
+    let (ftype, nlink) = match &node.kind {
         NodeKind::Directory { subdir_count, .. } => {
             // Unix convention: nlink = 2 (`.` + parent's `..` to here) + one
             // per subdirectory's `..`. Files are NOT counted. macOS `find`
             // uses `nlink - 2` to short-circuit traversal, so over-counting
             // makes find skip real subdirectories.
-            (ftype3::NF3DIR, 0o555, 2 + *subdir_count)
+            (ftype3::NF3DIR, 2 + *subdir_count)
         }
-        NodeKind::File { .. } => (ftype3::NF3REG, 0o444, 1),
+        NodeKind::File { .. } => (ftype3::NF3REG, 1),
     };
-    let mode = if node.attrs.mode == 0 {
-        mode_default
-    } else {
-        node.attrs.mode & 0o7777
-    };
+    // `attrs.mode` is always populated: synthetic constructors set 0o555/0o444,
+    // `from_metadata` propagates the on-disk mode. No fallback needed.
+    let mode = node.attrs.mode & 0o7777;
     fattr3 {
         ftype,
         mode,

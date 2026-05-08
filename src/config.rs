@@ -71,10 +71,15 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let mut cfg: Config = serde_yaml::from_str(&text)
+        let mut cfg: Config = serde_yml::from_str(&text)
             .with_context(|| format!("parsing config {}", path.display()))?;
         cfg.validate()?;
         cfg.canonicalize_roots();
+        // Pre-lowercase hide patterns so `is_hidden` (called once per
+        // directory entry on every scan) doesn't re-allocate per call.
+        for pat in &mut cfg.options.hide_patterns {
+            *pat = pat.to_lowercase();
+        }
         Ok(cfg)
     }
 
@@ -103,7 +108,7 @@ impl Config {
             anyhow::bail!("config has no shares");
         }
         for (name, share) in &self.shares {
-            if name.is_empty() || name.contains('/') {
+            if !is_valid_path_segment(name) {
                 anyhow::bail!("invalid share name {name:?}");
             }
             if share.merge.is_empty() && share.mount.is_empty() {
@@ -115,7 +120,7 @@ impl Config {
                 }
             }
             for (mname, p) in &share.mount {
-                if mname.is_empty() || mname.contains('/') {
+                if !is_valid_path_segment(mname) {
                     anyhow::bail!("share {name} has invalid mount name {mname:?}");
                 }
                 if !p.is_absolute() {
@@ -134,14 +139,25 @@ impl Config {
             return true;
         }
         // Patterns are simple case-insensitive substrings for v1.
+        // Patterns are pre-lowercased in `Config::load`.
         let lower = name.to_lowercase();
         for pat in &self.options.hide_patterns {
-            if lower.contains(&pat.to_lowercase()) {
+            if lower.contains(pat) {
                 return true;
             }
         }
         false
     }
+}
+
+/// Names that become directory entries served over NFS. Reject empty,
+/// path-component characters, control chars, and surrounding whitespace
+/// — all of which produce surprising client-side behaviour.
+fn is_valid_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('/')
+        && s.trim() == s
+        && !s.chars().any(|c| c.is_control())
 }
 
 #[cfg(test)]
@@ -208,7 +224,9 @@ mod tests {
             BTreeMap::new(),
             Options {
                 hide_dotfiles: false,
-                hide_patterns: vec!["thumbs.db".into(), "@eaDir".into()],
+                // Patterns are pre-lowercased by `Config::load`; tests
+                // constructing `Config` directly must match that contract.
+                hide_patterns: vec!["thumbs.db".into(), "@eadir".into()],
                 follow_symlinks: false,
             },
         );

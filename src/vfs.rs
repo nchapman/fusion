@@ -13,10 +13,7 @@ use lru::LruCache;
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use nfsserve::nfs::{
-    cookieverf3, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3,
-    specdata3,
-};
+use nfsserve::nfs::{cookieverf3, fattr3, fileid3, filename3, nfspath3, nfsstat3, sattr3};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 use crate::attrs::fattr3_for;
@@ -105,9 +102,9 @@ impl FusionFs {
     }
 }
 
-fn name_to_str(name: &filename3) -> Option<String> {
+fn name_to_str(name: &filename3) -> Option<&str> {
     // filename3 derefs to bytes via its inner Vec<u8>.
-    std::str::from_utf8(name.as_ref()).ok().map(str::to_string)
+    std::str::from_utf8(name.as_ref()).ok()
 }
 
 #[async_trait]
@@ -132,7 +129,7 @@ impl NFSFileSystem for FusionFs {
             let node = tree.get(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
             return Ok(node.parent.unwrap_or(ROOT_ID));
         }
-        tree.child(dirid, &name).ok_or(nfsstat3::NFS3ERR_NOENT)
+        tree.child(dirid, name).ok_or(nfsstat3::NFS3ERR_NOENT)
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
@@ -217,7 +214,11 @@ impl NFSFileSystem for FusionFs {
                 return Err(io_to_nfs(&e));
             }
         };
-        let eof = offset + buf.len() as u64 >= file_size;
+        // EOF if we've reached the cached file size, OR if pread returned
+        // fewer bytes than asked (hit physical end-of-file). Using stale
+        // `file_size` alone could mis-report eof on a file that grew between
+        // rescans.
+        let eof = offset + buf.len() as u64 >= file_size || buf.len() < want;
         Ok((buf, eof))
     }
 
@@ -339,10 +340,6 @@ fn io_to_nfs(e: &std::io::Error) -> nfsstat3 {
         _ => nfsstat3::NFS3ERR_IO,
     }
 }
-
-// Suppress unused-import warning for types used only in trait bounds.
-#[allow(dead_code)]
-fn _types(_a: ftype3, _b: nfstime3, _c: specdata3) {}
 
 #[cfg(test)]
 mod tests {

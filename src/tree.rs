@@ -98,7 +98,6 @@ impl NodeKind {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Node {
     pub id: NodeId,
     pub parent: Option<NodeId>,
@@ -110,11 +109,6 @@ pub struct Node {
 impl Node {
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, NodeKind::Directory { .. })
-    }
-
-    #[allow(dead_code)]
-    pub fn is_file(&self) -> bool {
-        matches!(self.kind, NodeKind::File { .. })
     }
 }
 
@@ -223,14 +217,12 @@ impl Tree {
                 *subdir_count += 1;
             }
         }
-        // Bump parent mtime so Linux NFS clients invalidate dentry cache.
-        // RFC 2623 / Linux behavior: client uses parent dir mtime as the
-        // freshness key; without this, ls can serve stale listings.
-        let now = std::time::SystemTime::now();
-        if let Some(p) = self.get_mut(parent) {
-            p.attrs.mtime = now;
-            p.attrs.ctime = now;
-        }
+        // Linux NFS clients use parent mtime as the dentry-cache freshness
+        // key (RFC 1813 §2): without this bump, `ls` may serve stale listings
+        // until the cache TTL expires.
+        let now = SystemTime::now();
+        parent_node.attrs.mtime = now;
+        parent_node.attrs.ctime = now;
         Some(id)
     }
 
@@ -384,7 +376,7 @@ impl Tree {
     /// Remove `path` from a directory's physical source list. Returns true if
     /// the directory is now sourceless (caller should remove it). Also clears
     /// the path_index entry that pointed `path` at this directory.
-    pub fn drop_dir_source(&mut self, id: NodeId, path: &PathBuf) -> bool {
+    pub fn drop_dir_source(&mut self, id: NodeId, path: &Path) -> bool {
         let now_empty = if let Some(node) = self.get_mut(id) {
             match &mut node.kind {
                 NodeKind::Directory {
