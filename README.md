@@ -55,10 +55,15 @@ cargo run --release -- --config config.yaml
 docker compose up --build
 # or pull the prebuilt multi-arch image (amd64 / arm64)
 docker run --rm --network host \
+  -e PUID=1000 -e PGID=1000 \
   -v "$PWD/config.yaml":/etc/fusion/config.yaml:ro \
   -v /mnt:/mnt:ro \
   ghcr.io/nchapman/fusion:latest
 ```
+
+Set `PUID`/`PGID` to the UID/GID that owns your media. Common values:
+**Unraid** `99:100`, **Synology** typically `1024+:100`, **TrueNAS** whatever
+owns the dataset. Defaults are `1000:1000`. Set both to `0` to run as root.
 
 The default bind is `0.0.0.0:11111` (non-privileged). To expose port 2049 on
 Linux, give the binary `CAP_NET_BIND_SERVICE` or set

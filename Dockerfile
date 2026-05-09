@@ -18,11 +18,15 @@ RUN --mount=type=cache,target=/build/target \
     cp target/release/fusion /usr/local/bin/fusion
 
 FROM debian:bookworm-slim
+# `gosu` drops privileges in the entrypoint after we've fixed up UIDs/perms
+# as root. `passwd` provides usermod/groupmod for the PUID/PGID dance.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get install -y --no-install-recommends ca-certificates gosu passwd && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -r -s /usr/sbin/nologin -u 1000 fusion
 COPY --from=builder /usr/local/bin/fusion /usr/local/bin/fusion
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Default bind is 0.0.0.0:11111 (non-privileged). For production NFS on
 # port 2049 you'll need CAP_NET_BIND_SERVICE on the binary or
@@ -31,6 +35,7 @@ COPY --from=builder /usr/local/bin/fusion /usr/local/bin/fusion
 EXPOSE 11111/tcp
 
 ENV RUST_LOG=info
-USER fusion
-ENTRYPOINT ["/usr/local/bin/fusion"]
+# Entrypoint runs as root so it can usermod + chown, then drops to PUID:PGID
+# via gosu. Set PUID=0 PGID=0 to skip the drop entirely.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--config", "/etc/fusion/config.yaml"]

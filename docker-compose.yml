@@ -11,3 +11,10 @@ services:
       # - /mnt/archive:/mnt/archive:ro
     environment:
       RUST_LOG: info
+      # Match these to the UID/GID that owns your media. Common values:
+      #   Unraid:   PUID=99    PGID=100   (nobody:users)
+      #   Synology: PUID=1024  PGID=100   (varies — check `id <user>`)
+      #   TrueNAS:  whatever the dataset's owner is
+      # Set both to 0 to run as root.
+      PUID: 1000
+      PGID: 1000
