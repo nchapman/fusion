@@ -134,6 +134,12 @@ impl NFSFileSystem for FusionFs {
             return Ok(dirid);
         }
         if name == ".." {
+            // RFC convention: `..` on the root resolves to the root. We also
+            // explicitly trap ROOT_ID here so clients never traverse into
+            // the hidden INTERNAL_ROOT_ID placeholder.
+            if dirid == ROOT_ID {
+                return Ok(ROOT_ID);
+            }
             let node = tree.get(dirid).ok_or(nfsstat3::NFS3ERR_STALE)?;
             return Ok(node.parent.unwrap_or(ROOT_ID));
         }
