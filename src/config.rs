@@ -779,6 +779,131 @@ mod tests {
     }
 
     #[test]
+    fn load_parses_subdir_list_shorthand() {
+        // List form `Movies: [/p1, /p2]` works inside subdirs same as it
+        // does at the top level, sugar for `{ merge: [/p1, /p2] }`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Library:\n    subdirs:\n      Movies:\n        - /tmp/a\n        - /tmp/b\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        let movies = &cfg.shares["Library"].subdirs["Movies"];
+        assert_eq!(
+            movies.merge,
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+        assert_eq!(movies.dedupe_depth, None);
+    }
+
+    #[test]
+    fn load_parses_three_level_nested_subdirs() {
+        // No depth limit on `subdirs:` recursion — verify three levels
+        // round-trip cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  L1:\n    subdirs:\n      L2:\n        subdirs:\n          L3: /tmp/leaf\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        let l3 = &cfg.shares["L1"].subdirs["L2"].subdirs["L3"];
+        assert_eq!(l3.merge, vec![PathBuf::from("/tmp/leaf")]);
+    }
+
+    #[test]
+    fn validate_rejects_dedupe_depth_zero_on_nested_subdir() {
+        // The dedupe-depth-0 ban applies recursively, and the error must
+        // identify the nested location with `parent/child` notation so
+        // users can find the offending key.
+        assert_load_err(
+            "shares:\n  Library:\n    subdirs:\n      Movies:\n        merge:\n          - /tmp/a\n        dedupe_depth: 0\n",
+            "library/movies",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_nested_subdir() {
+        // A subdir with neither `merge:` nor its own `subdirs:` is empty
+        // and almost certainly a mistake — surface it loudly.
+        assert_load_err(
+            "shares:\n  Library:\n    subdirs:\n      Movies: {}\n",
+            "library/movies",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_subdir_name_at_depth() {
+        // Subdir names are path components served over NFS. Names with
+        // slashes break readdir/lookup; reject at any depth, not just the
+        // top level.
+        assert_load_err(
+            "shares:\n  Library:\n    subdirs:\n      \"bad/name\":\n        merge: [/tmp/a]\n",
+            "bad/name",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overlapping_merge_roots_in_nested_subdir() {
+        // Overlap detection must run recursively. The watcher would
+        // double-fire under the inner path otherwise.
+        assert_load_err(
+            "shares:\n  Library:\n    subdirs:\n      Movies:\n        merge:\n          - /tmp/parent\n          - /tmp/parent/child\n",
+            "overlap",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_nested_relative_path_at_top_but_rejects_at_depth() {
+        // Absolute-path requirement applies recursively. Use a relative
+        // path under a nested subdir and confirm the validator catches it.
+        assert_load_err(
+            "shares:\n  Library:\n    subdirs:\n      Movies:\n        merge:\n          - relative/path\n",
+            "must be absolute",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_subdir_only_share_with_no_top_level_merge() {
+        // The Infuse-friendly shape: outer share has no `merge:`, only
+        // `subdirs:`. Must validate cleanly (this used to be the case for
+        // the top-level path-only `subdirs` form too).
+        let yaml = "shares:\n  \
+                    Library:\n    \
+                    subdirs:\n      \
+                    Movies: /tmp\n      \
+                    TV: /tmp/tv\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        Config::load(&path).expect("load should succeed");
+    }
+
+    #[test]
+    fn dedupe_depth_attaches_to_the_correct_nesting_level() {
+        // Outer share has dedupe_depth: 2; a subdir has dedupe_depth: 1;
+        // an inner-inner subdir has none. Each must round-trip to its own
+        // ShareConfig, not bleed across levels.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Outer:\n    merge: [/tmp/o1, /tmp/o2]\n    dedupe_depth: 2\n    subdirs:\n      Mid:\n        merge: [/tmp/m1, /tmp/m2]\n        dedupe_depth: 1\n        subdirs:\n          Leaf: /tmp/leaf\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        assert_eq!(cfg.shares["Outer"].dedupe_depth, Some(2));
+        assert_eq!(cfg.shares["Outer"].subdirs["Mid"].dedupe_depth, Some(1));
+        assert_eq!(
+            cfg.shares["Outer"].subdirs["Mid"].subdirs["Leaf"].dedupe_depth,
+            None
+        );
+    }
+
+    #[test]
     fn validate_rejects_dedupe_depth_zero() {
         // Depth 0 would dedupe at the share root itself, which makes the
         // second root contribute nothing — almost certainly a config error.

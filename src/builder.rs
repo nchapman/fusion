@@ -1649,6 +1649,145 @@ mod tests {
     }
 
     #[test]
+    fn build_three_level_nested_subdirs_each_get_their_own_node() {
+        // A grand-subdir should appear as a real directory at the right
+        // path with the right contents — i.e. recursion in the builder
+        // doesn't lose levels or attach contents to the wrong parent.
+        let leaf = TempDir::new().unwrap();
+        touch(&leaf.path().join("inner.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "L1".to_string(),
+            ShareConfig {
+                merge: vec![],
+                subdirs: {
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "L2".to_string(),
+                        ShareConfig {
+                            merge: vec![],
+                            subdirs: {
+                                let mut m2 = BTreeMap::new();
+                                m2.insert(
+                                    "L3".to_string(),
+                                    ShareConfig {
+                                        merge: vec![leaf.path().to_path_buf()],
+                                        ..Default::default()
+                                    },
+                                );
+                                m2
+                            },
+                            dedupe_depth: None,
+                        },
+                    );
+                    m
+                },
+                dedupe_depth: None,
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let l1 = tree.child(ROOT_ID, "L1").unwrap();
+        let l2 = tree.child(l1, "L2").unwrap();
+        let l3 = tree.child(l2, "L3").unwrap();
+        assert_eq!(child_names(&tree, l3), vec!["inner.mkv".to_string()]);
+    }
+
+    #[test]
+    fn build_dedupe_depth_inside_subdir_is_independent_of_parent() {
+        // Outer share has no dedupe; inner subdir has dedupe_depth=1.
+        // Verify the inner dedupe fires (one folder kept) without leaking
+        // into the outer level.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Movie/r1.mkv"));
+        touch(&r2.path().join("Movie/r2.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Library".to_string(),
+            ShareConfig {
+                merge: vec![],
+                subdirs: {
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "Movies".to_string(),
+                        ShareConfig {
+                            merge: vec![r1.path().to_path_buf(), r2.path().to_path_buf()],
+                            subdirs: BTreeMap::new(),
+                            dedupe_depth: Some(1),
+                        },
+                    );
+                    m
+                },
+                dedupe_depth: None,
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let library = tree.child(ROOT_ID, "Library").unwrap();
+        let movies = tree.child(library, "Movies").unwrap();
+        let movie = tree.child(movies, "Movie").unwrap();
+        // Dedupe at the inner Movies level kept only r1's copy; r2's
+        // contents were shadowed entirely.
+        assert_eq!(child_names(&tree, movie), vec!["r1.mkv".to_string()]);
+    }
+
+    #[test]
+    fn build_subdir_of_subdir_shadows_parent_merge_entry_of_same_name() {
+        // The "subdir wins over a merge entry of the same name" rule must
+        // apply at every level, not just the share-root level.
+        let outer_merge = TempDir::new().unwrap();
+        // Create nested folder structure that would otherwise contribute
+        // a name colliding with the inner subdir.
+        touch(&outer_merge.path().join("Wrapper/Special/from_merge.mkv"));
+        let inner = TempDir::new().unwrap();
+        touch(&inner.path().join("from_subdir.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Top".to_string(),
+            ShareConfig {
+                merge: vec![outer_merge.path().to_path_buf()],
+                subdirs: {
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "Wrapper".to_string(),
+                        ShareConfig {
+                            merge: vec![],
+                            subdirs: {
+                                let mut m2 = BTreeMap::new();
+                                m2.insert(
+                                    "Special".to_string(),
+                                    ShareConfig {
+                                        merge: vec![inner.path().to_path_buf()],
+                                        ..Default::default()
+                                    },
+                                );
+                                m2
+                            },
+                            dedupe_depth: None,
+                        },
+                    );
+                    m
+                },
+                dedupe_depth: None,
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let top = tree.child(ROOT_ID, "Top").unwrap();
+        let wrapper = tree.child(top, "Wrapper").unwrap();
+        let special = tree.child(wrapper, "Special").unwrap();
+        // The subdir at depth 2 wins; the merge root's `Special/` is shadowed.
+        assert_eq!(
+            child_names(&tree, special),
+            vec!["from_subdir.mkv".to_string()]
+        );
+    }
+
+    #[test]
     fn apply_snapshot_preserves_sorted_order_when_adding_entries() {
         // The drainer relies on `apply_snapshot` keeping each touched
         // directory's `sorted=true` invariant — `finalize_sort` is no longer

@@ -616,6 +616,58 @@ mod tests {
     }
 
     #[test]
+    fn collect_roots_returns_one_per_merge_root_inside_a_nested_subdir() {
+        // A subdir that itself declares `merge: [a, b]` must produce two
+        // WatchRoots — one per physical root — both pointed at the
+        // subdir's virtual node, with priority 1, 2 (matching the merge
+        // priority convention). Without this, watcher events on b would
+        // never fire and the union would silently miss updates.
+        let m1 = tempfile::tempdir().unwrap();
+        let m2 = tempfile::tempdir().unwrap();
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Library".to_string(),
+            ShareConfig {
+                merge: vec![],
+                subdirs: {
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "Movies".to_string(),
+                        ShareConfig {
+                            merge: vec![m1.path().to_path_buf(), m2.path().to_path_buf()],
+                            subdirs: BTreeMap::new(),
+                            dedupe_depth: Some(1),
+                        },
+                    );
+                    m
+                },
+                dedupe_depth: None,
+            },
+        );
+        let cfg = cfg_with(shares);
+        let tree = build(&cfg, 0).unwrap();
+
+        let library = tree.child(ROOT_ID, "Library").unwrap();
+        let movies = tree.child(library, "Movies").unwrap();
+
+        let roots = collect_roots(&cfg, &tree);
+        assert_eq!(roots.len(), 2, "two nested merge roots = 2 watch roots");
+
+        let mut by_path: Vec<_> = roots
+            .iter()
+            .map(|r| (r.physical.clone(), r.virtual_id, r.priority))
+            .collect();
+        by_path.sort_by_key(|(_, _, p)| *p);
+        assert_eq!(by_path[0].0, m1.path());
+        assert_eq!(by_path[0].1, movies);
+        assert_eq!(by_path[0].2, 1);
+        assert_eq!(by_path[1].0, m2.path());
+        assert_eq!(by_path[1].1, movies);
+        assert_eq!(by_path[1].2, 2);
+    }
+
+    #[test]
     fn collect_roots_returns_empty_for_share_with_no_sources() {
         let cfg = cfg_with(BTreeMap::new());
         let tree = Tree::new(0);
