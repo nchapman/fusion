@@ -102,9 +102,26 @@ pub fn snapshot_dir(physical: &Path, config: &Config, depth: usize) -> Option<Di
     })
 }
 
-/// Apply a `DirSnapshot` to the in-memory tree. All work is *almost* in-
-/// memory — only shadow-dir promotion may re-snapshot a previously-
-/// shadowed root path from disk. Caller holds the write lock.
+/// A directory-shadow promotion the apply phase wants to install but
+/// has deferred so its `snapshot_dir` disk read can happen *outside*
+/// the tree write lock. The drainer re-acquires the lock and calls
+/// `install_pending_promotions` to finish them.
+#[derive(Debug)]
+pub struct PendingPromotion {
+    pub parent: NodeId,
+    pub name: String,
+    pub shadow: ShadowDir,
+}
+
+/// Apply a `DirSnapshot` to the in-memory tree. RAM-only: the snapshot
+/// has already been read from disk by the caller, and any directory-shadow
+/// promotions needed to keep the cache always-correct are *deferred* into
+/// `pending` rather than executed inline (since they would otherwise
+/// require `snapshot_dir` disk reads under the write lock). The drainer
+/// runs `install_pending_promotions` after releasing the lock.
+///
+/// File-shadow promotions are not deferred — installing them is RAM-only
+/// (the loser's attrs were captured at the time of shadowing).
 ///
 /// `root_priority` is the index of the source root in its share's `merge`
 /// list (lower = higher precedence). It controls two things:
@@ -114,14 +131,16 @@ pub fn snapshot_dir(physical: &Path, config: &Config, depth: usize) -> Option<Di
 ///      existing winner is demoted (becomes a shadow) iff the incoming
 ///      root has higher priority than the current owner.
 ///
-/// `config` is needed to re-snapshot a promoted directory shadow (so we
-/// don't have to keep parallel snapshot trees in memory for every loser).
+/// `config` is plumbed through for parity with promotion install paths
+/// even though `apply_snapshot` itself does no disk I/O — keeps the
+/// signature stable across the inline and deferred call sites.
 pub fn apply_snapshot(
     tree: &mut Tree,
     virtual_id: NodeId,
     snap: &DirSnapshot,
     root_priority: usize,
     config: &Config,
+    pending: &mut Vec<PendingPromotion>,
 ) {
     tree.extend_dir_sources(virtual_id, snap.physical.clone());
 
@@ -197,7 +216,7 @@ pub fn apply_snapshot(
                         // sees the loser without waiting for the periodic
                         // rescan. Marks the name handled so the add-new
                         // pass won't double-install.
-                        if try_promote_shadow(tree, virtual_id, &name, config) {
+                        if try_promote_shadow(tree, virtual_id, &name, pending) {
                             handled_names.insert(name.clone());
                         }
                     }
@@ -225,7 +244,7 @@ pub fn apply_snapshot(
                         let old_visible = tree
                             .get(*child_id)
                             .map(|n| (n.attrs.size, n.attrs.mtime, n.attrs.mode));
-                        apply_snapshot(tree, *child_id, sub, root_priority, config);
+                        apply_snapshot(tree, *child_id, sub, root_priority, config, pending);
                         if let (Some(old), Some(node)) = (old_visible, tree.get(*child_id)) {
                             let new = (node.attrs.size, node.attrs.mtime, node.attrs.mode);
                             if old != new {
@@ -248,7 +267,7 @@ pub fn apply_snapshot(
                             tree.remove_recursive(*child_id);
                             // Promote a shadowed loser if any (mirrors the
                             // file-removal branch above).
-                            if try_promote_shadow(tree, virtual_id, &name, config) {
+                            if try_promote_shadow(tree, virtual_id, &name, pending) {
                                 handled_names.insert(name.clone());
                             }
                         } else {
@@ -273,13 +292,21 @@ pub fn apply_snapshot(
                     sub.attrs.clone(),
                 ) {
                     tree.set_winner_priority(child_id, Some(root_priority));
-                    apply_snapshot(tree, child_id, sub, root_priority, config);
+                    apply_snapshot(tree, child_id, sub, root_priority, config, pending);
                 } else {
                     // Name already owned. Compare priorities: if we outrank
                     // the current owner, demote them and install ourselves.
                     // Otherwise, record ourselves as a shadow so the user
                     // gets us if the winner later disappears.
-                    handle_dir_collision(tree, virtual_id, name, sub, root_priority, config);
+                    handle_dir_collision(
+                        tree,
+                        virtual_id,
+                        name,
+                        sub,
+                        root_priority,
+                        config,
+                        pending,
+                    );
                 }
             }
             EntrySnapshot::File { path, attrs } => {
@@ -351,25 +378,20 @@ pub fn apply_snapshot(
     }
 }
 
-/// Pop the highest-priority shadow at `name` (file or dir) and install it as
-/// the new winner. Returns `true` if a shadow was promoted; `false` if no
-/// shadows exist (or none could be installed — e.g. the shadowed dir's path
-/// was deleted while shadowed). On failure to install a popped shadow, the
-/// next highest-priority shadow is tried.
-///
-/// **Lock-hold exception.** Promoting a directory shadow requires
-/// `snapshot_dir` to read the loser root's subtree from disk while the
-/// caller holds the tree write lock — a deliberate violation of the
-/// "apply is RAM-only" invariant in CLAUDE.md. The cost is bounded: one
-/// `read_dir` per directory level for a single promoted subtree, only on
-/// the (rare) winner-removal path. A two-phase split (decide-then-IO-
-/// then-install) would preserve the invariant cleanly but isn't worth
-/// the complexity at this scale; revisit if promotion latency shows up
-/// in production traces.
-fn try_promote_shadow(tree: &mut Tree, parent: NodeId, name: &str, config: &Config) -> bool {
+/// Pop the highest-priority shadow at `name`. File shadows install inline
+/// (RAM-only). Directory shadows are *deferred* into `pending` so the
+/// caller can run their `snapshot_dir` outside the tree write lock; the
+/// slot stays empty until `install_pending_promotions` fills it. Returns
+/// `true` if a promotion was installed or scheduled.
+fn try_promote_shadow(
+    tree: &mut Tree,
+    parent: NodeId,
+    name: &str,
+    pending: &mut Vec<PendingPromotion>,
+) -> bool {
     loop {
         // Peek both shadow lists' heads to decide which type to promote.
-        // Lower priority value wins; ties prefer files (cheaper to install
+        // Lower priority value wins; ties prefer files (RAM-only, cheaper
         // and equally correct since priorities are unique per root).
         let (file_pri, dir_pri) = match tree.get(parent).map(|n| &n.kind) {
             Some(NodeKind::Directory { shadows, .. }) => match shadows.as_deref() {
@@ -407,36 +429,178 @@ fn try_promote_shadow(tree: &mut Tree, parent: NodeId, name: &str, config: &Conf
                 continue;
             }
         } else if let Some(shadow) = tree.pop_shadow_dir(parent, name) {
-            // Re-snapshot the loser's path. If it's also gone, drop this
-            // shadow and try the next.
-            match snapshot_dir(&shadow.physical, config, 0) {
-                Some(snap) => {
-                    let attrs = snap.attrs.clone();
-                    if let Some(id) =
-                        tree.add_child(parent, name.to_string(), NodeKind::empty_dir(), attrs)
-                    {
-                        info!(name=%name, root=%shadow.physical.display(), priority=shadow.priority,
-                              "promoting shadowed directory");
-                        tree.set_winner_priority(id, Some(shadow.priority));
-                        // Use merge_snapshot (build-time semantics) since
-                        // we're starting from an empty dir with a single
-                        // source. No dedupe — the promoted root is alone.
-                        merge_snapshot(tree, id, &snap, None, shadow.priority);
-                        return true;
-                    }
-                    continue;
+            // Defer dir-shadow promotion: installing requires `snapshot_dir`
+            // (disk I/O) and the caller currently holds the tree write
+            // lock. The drainer releases the lock, runs snapshot_dir, then
+            // re-acquires for `install_pending_promotions`.
+            info!(name=%name, root=%shadow.physical.display(), priority=shadow.priority,
+                  "scheduling shadowed directory promotion (deferred snapshot)");
+            pending.push(PendingPromotion {
+                parent,
+                name: name.to_string(),
+                shadow,
+            });
+            return true;
+        }
+        return false;
+    }
+}
+
+/// Convenience wrapper: run `apply_snapshot` and immediately install any
+/// deferred directory-shadow promotions inline. Use this in tests and
+/// other contexts that don't need the watcher's two-phase lock-release
+/// semantics. Production code (the watcher's drainer) should call
+/// `apply_snapshot` and `install_pending_promotions` separately so the
+/// disk I/O for promotions happens with the tree write lock released.
+pub fn apply_snapshot_inline(
+    tree: &mut Tree,
+    virtual_id: NodeId,
+    snap: &DirSnapshot,
+    root_priority: usize,
+    config: &Config,
+) {
+    let mut pending = Vec::new();
+    apply_snapshot(tree, virtual_id, snap, root_priority, config, &mut pending);
+    while !pending.is_empty() {
+        let snapshotted = snapshot_pending_promotions(pending, config);
+        pending = install_pending_promotions(tree, snapshotted);
+    }
+}
+
+/// Phase A of the two-phase install: do the disk reads (`snapshot_dir`)
+/// for each deferred promotion, with NO tree lock held by the caller.
+/// Returns each pending paired with its freshly-read snapshot (or `None`
+/// if the loser path has also vanished).
+pub fn snapshot_pending_promotions(
+    pending: Vec<PendingPromotion>,
+    config: &Config,
+) -> Vec<(PendingPromotion, Option<DirSnapshot>)> {
+    pending
+        .into_iter()
+        .map(|p| {
+            let snap = snapshot_dir(&p.shadow.physical, config, 0);
+            (p, snap)
+        })
+        .collect()
+}
+
+/// Phase B: install previously-snapshotted promotions. RAM-only — caller
+/// holds the tree write lock. Each slot is re-checked before installing:
+/// another concurrent apply may have already filled the name, or the
+/// parent itself may have been removed; both cases are handled.
+///
+/// If a promotion's shadow was a directory whose path turned out to be
+/// gone too (`snap` is `None`), this function pops the *next* shadow
+/// for the same name from the tree and returns it as a retry. The caller
+/// should re-snapshot the retries (no lock needed) and call this again,
+/// looping until the retry list is empty. This preserves the original
+/// "try shadows in priority order until one installs" semantics that
+/// the two-phase split would otherwise have lost.
+#[must_use = "retries must be re-snapshotted and re-installed; otherwise stale shadows leak"]
+pub fn install_pending_promotions(
+    tree: &mut Tree,
+    snapshotted: Vec<(PendingPromotion, Option<DirSnapshot>)>,
+) -> Vec<PendingPromotion> {
+    let mut retries = Vec::new();
+    for (p, snap) in snapshotted {
+        // Parent must still exist. add_child also defends against this,
+        // but checking here lets us short-circuit cleanly and log.
+        if tree.get(p.parent).is_none() {
+            info!(name=%p.name, "skipping deferred promotion — parent node removed");
+            continue;
+        }
+        // Slot may have been filled while we did disk I/O for the
+        // snapshot phase (e.g. a higher-priority root rescan that came
+        // in while we were releasing the lock between phases).
+        if tree.child(p.parent, &p.name).is_some() {
+            continue;
+        }
+        match snap {
+            Some(snap) => {
+                let attrs = snap.attrs.clone();
+                if let Some(id) =
+                    tree.add_child(p.parent, p.name.clone(), NodeKind::empty_dir(), attrs)
+                {
+                    info!(name=%p.name, root=%p.shadow.physical.display(), priority=p.shadow.priority,
+                          "installing deferred directory promotion");
+                    tree.set_winner_priority(id, Some(p.shadow.priority));
+                    merge_snapshot(tree, id, &snap, None, p.shadow.priority);
                 }
-                None => {
-                    // The shadowed loser's path is gone too. Move on.
-                    info!(name=%name, root=%shadow.physical.display(),
-                          "skipping promotion — shadowed root no longer present");
-                    continue;
+            }
+            None => {
+                // Shadowed root path is gone. Pop the next-best shadow
+                // (file or dir) and either install it inline (file:
+                // RAM-only) or queue it as a retry (dir: needs another
+                // round of disk I/O outside the lock).
+                if let Some(next) = pop_next_shadow_for_promotion(tree, p.parent, &p.name) {
+                    match next {
+                        NextShadow::File(s) => {
+                            let kind = NodeKind::File {
+                                backing: s.backing.clone(),
+                            };
+                            if let Some(id) =
+                                tree.add_child(p.parent, p.name.clone(), kind, s.attrs)
+                            {
+                                info!(name=%p.name, backing=%s.backing.display(), priority=s.priority,
+                                      "promoting next shadow (file) after dir-shadow path vanished");
+                                tree.index_file(s.backing, id);
+                                tree.set_winner_priority(id, Some(s.priority));
+                            }
+                        }
+                        NextShadow::Dir(s) => {
+                            info!(name=%p.name, root=%s.physical.display(), priority=s.priority,
+                                  "scheduling retry — previous dir-shadow path vanished");
+                            retries.push(PendingPromotion {
+                                parent: p.parent,
+                                name: p.name.clone(),
+                                shadow: s,
+                            });
+                        }
+                    }
+                } else {
+                    info!(name=%p.name, "no further shadows; slot stays empty");
                 }
             }
         }
-        // Reached only if both peek values were None (handled above), or
-        // pop returned None despite peek seeing a head — defensive break.
-        return false;
+    }
+    retries
+}
+
+enum NextShadow {
+    File(ShadowFile),
+    Dir(ShadowDir),
+}
+
+/// Pop the highest-priority remaining shadow at `name`, choosing whichever
+/// of file/dir has lower priority value (ties prefer file — RAM-only).
+fn pop_next_shadow_for_promotion(
+    tree: &mut Tree,
+    parent: NodeId,
+    name: &str,
+) -> Option<NextShadow> {
+    let (file_pri, dir_pri) = match tree.get(parent).map(|n| &n.kind) {
+        Some(NodeKind::Directory { shadows, .. }) => match shadows.as_deref() {
+            Some(s) => (
+                s.files
+                    .get(name)
+                    .and_then(|v| v.first())
+                    .map(|x| x.priority),
+                s.dirs.get(name).and_then(|v| v.first()).map(|x| x.priority),
+            ),
+            None => return None,
+        },
+        _ => return None,
+    };
+    let pop_file = match (file_pri, dir_pri) {
+        (Some(fp), Some(dp)) => fp <= dp,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => return None,
+    };
+    if pop_file {
+        tree.pop_shadow_file(parent, name).map(NextShadow::File)
+    } else {
+        tree.pop_shadow_dir(parent, name).map(NextShadow::Dir)
     }
 }
 
@@ -451,6 +615,7 @@ fn handle_dir_collision(
     sub: &DirSnapshot,
     root_priority: usize,
     config: &Config,
+    pending: &mut Vec<PendingPromotion>,
 ) {
     let Some(existing_id) = tree.child(parent, name) else {
         return;
@@ -487,7 +652,7 @@ fn handle_dir_collision(
             sub.attrs.clone(),
         ) {
             tree.set_winner_priority(child_id, Some(root_priority));
-            apply_snapshot(tree, child_id, sub, root_priority, config);
+            apply_snapshot(tree, child_id, sub, root_priority, config, pending);
         }
     } else {
         // Incoming loses. Record as shadow (or update an existing shadow
@@ -801,7 +966,7 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             }
         }
 
-        for (priority, root) in share.merge.iter().enumerate() {
+        for (idx, root) in share.merge.iter().enumerate() {
             if !root.exists() {
                 warn!(share=%share_name, root=%root.display(), "merge root missing; skipping");
                 continue;
@@ -812,7 +977,12 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
                 is_subdir: false,
                 label: format!("{share_name}:merge:{}", root.display()),
                 dedupe_remaining: share.dedupe_depth.map(|d| d.saturating_sub(1)),
-                root_priority: priority,
+                // Priority 0 is reserved for subdirs (which always win at
+                // the share-root level over any merge entry of the same
+                // name). Merges start at 1 so the priority spaces don't
+                // overlap and a tied collision between merge[0] and a
+                // subdir name is impossible.
+                root_priority: idx + 1,
             });
         }
     }
@@ -1241,7 +1411,7 @@ mod tests {
         fs::remove_file(root.path().join("gone.mkv")).unwrap();
         touch(&root.path().join("new.mkv"));
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap2, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap2, 0, &cfg);
 
         assert!(tree.child(share, "keep.mkv").is_some());
         assert!(tree.child(share, "gone.mkv").is_none());
@@ -1278,7 +1448,7 @@ mod tests {
         tree.get_mut(share).unwrap().attrs.mtime = SystemTime::UNIX_EPOCH;
         std::fs::write(&path, b"v2-longer-content").unwrap();
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap2, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap2, 0, &cfg);
 
         let mtime_after = tree.get(share).unwrap().attrs.mtime;
         assert!(
@@ -1391,7 +1561,7 @@ mod tests {
         std::fs::write(root.path().join("c.mkv"), b"").unwrap();
         std::fs::write(root.path().join("aa.mkv"), b"").unwrap();
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap2, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap2, 0, &cfg);
 
         assert_eq!(
             child_names(&tree, share),
@@ -1434,7 +1604,7 @@ mod tests {
         std::fs::write(entry.join("inner.txt"), b"x").unwrap();
 
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap2, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap2, 0, &cfg);
 
         let entry_id = tree.child(share, "entry").expect("entry still present");
         assert!(
@@ -1487,7 +1657,7 @@ mod tests {
         // shadowed folder, and r2's full root is rescanned.
         touch(&r2.path().join("Inception (2010)/late-arrival.mkv"));
         let snap_r2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r2, 1, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r2, 1, &cfg);
 
         let movie = tree.child(share, "Inception (2010)").unwrap();
         assert_eq!(
@@ -1525,7 +1695,7 @@ mod tests {
         std::fs::write(&entry, b"now a file").unwrap();
 
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap2, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap2, 0, &cfg);
 
         let entry_id = tree.child(share, "entry").expect("entry still present");
         let node = tree.get(entry_id).unwrap();
@@ -1579,7 +1749,7 @@ mod tests {
         // Without the parent() check, the apply loop would treat it as a
         // stale file and call remove_recursive.
         let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r1, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r1, 0, &cfg);
 
         assert!(
             tree.child(share, "from_r1.mkv").is_some(),
@@ -1704,14 +1874,14 @@ mod tests {
         // Shadow tracking now lets the loser (r2) get promoted in place,
         // so we don't need a follow-up r2 scan to fully heal — but we'll
         // still do one to assert idempotency of the apply.
-        apply_snapshot(
+        apply_snapshot_inline(
             &mut tree,
             share,
             &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
             0,
             &cfg,
         );
-        apply_snapshot(
+        apply_snapshot_inline(
             &mut tree,
             share,
             &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
@@ -1798,7 +1968,7 @@ mod tests {
 
         std::fs::remove_dir_all(r1.path().join("Inception (2010)")).unwrap();
         let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r1, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r1, 0, &cfg);
 
         let movie = tree
             .child(share, "Inception (2010)")
@@ -1825,7 +1995,7 @@ mod tests {
         std::fs::remove_dir_all(r1.path().join("Inception (2010)")).unwrap();
         std::fs::remove_dir_all(r2.path().join("Inception (2010)")).unwrap();
         let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r1, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r1, 0, &cfg);
 
         assert!(
             tree.child(share, "Inception (2010)").is_none(),
@@ -1870,7 +2040,7 @@ mod tests {
         // r1 receives the same folder name.
         touch(&r1.path().join("Lone (2024)/r1.mkv"));
         let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r1, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r1, 0, &cfg);
 
         let movie = tree.child(share, "Lone (2024)").expect("present");
         assert_eq!(
@@ -1881,7 +2051,7 @@ mod tests {
         // Sanity: removing r1 again should now promote r2 back.
         std::fs::remove_dir_all(r1.path().join("Lone (2024)")).unwrap();
         let snap_r1b = snapshot_dir(r1.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r1b, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r1b, 0, &cfg);
         let movie = tree.child(share, "Lone (2024)").expect("r2 promoted back");
         assert_eq!(child_names(&tree, movie), vec!["r2.mkv".to_string()]);
     }
@@ -1915,7 +2085,7 @@ mod tests {
         // r2 contributes the same name later.
         touch(&r2.path().join("Movie/r2.mkv"));
         let snap_r2 = snapshot_dir(r2.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r2, 1, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r2, 1, &cfg);
 
         let movie = tree.child(share, "Movie").unwrap();
         assert_eq!(
@@ -1927,7 +2097,7 @@ mod tests {
         // promotes r2 immediately.
         std::fs::remove_dir_all(r1.path().join("Movie")).unwrap();
         let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap_r1, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap_r1, 0, &cfg);
         let movie = tree.child(share, "Movie").expect("r2 promoted from shadow");
         assert_eq!(child_names(&tree, movie), vec!["r2.mkv".to_string()]);
     }
@@ -1979,7 +2149,7 @@ mod tests {
 
         // r1 deletes → r2 promoted.
         std::fs::remove_file(r1.path().join("Movie.mkv")).unwrap();
-        apply_snapshot(
+        apply_snapshot_inline(
             &mut tree,
             share,
             &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
@@ -1993,7 +2163,7 @@ mod tests {
 
         // r2 deletes → r3 promoted.
         std::fs::remove_file(r2.path().join("Movie.mkv")).unwrap();
-        apply_snapshot(
+        apply_snapshot_inline(
             &mut tree,
             share,
             &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
@@ -2007,7 +2177,7 @@ mod tests {
 
         // r3 deletes → name fully gone.
         std::fs::remove_file(r3.path().join("Movie.mkv")).unwrap();
-        apply_snapshot(
+        apply_snapshot_inline(
             &mut tree,
             share,
             &snapshot_dir(r3.path(), &cfg, 0).unwrap(),
@@ -2055,7 +2225,7 @@ mod tests {
 
         // Loser deletes its copy.
         std::fs::remove_file(r2.path().join("Movie.mkv")).unwrap();
-        apply_snapshot(
+        apply_snapshot_inline(
             &mut tree,
             share,
             &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
@@ -2075,6 +2245,147 @@ mod tests {
         }
         // Sanity: r1 is still the visible owner.
         assert!(file_backing(&tree, share, "Movie.mkv").starts_with(r1.path()));
+    }
+
+    #[test]
+    fn two_phase_promotion_skips_slot_filled_between_phases() {
+        // Simulates the watcher race: apply_snapshot defers a dir-shadow
+        // promotion (winner removed, snapshot needs disk I/O), then before
+        // the install phase runs, another apply fills the slot. The
+        // install must skip the deferred promotion rather than clobber.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        touch(&r1.path().join("Movie/r1.mkv"));
+        touch(&r2.path().join("Movie/r2.mkv"));
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "M".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
+            Some(0),
+            1,
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
+            Some(0),
+            2,
+        );
+        tree.finalize_sort();
+
+        // r1 deletes its Movie folder. apply_snapshot defers a promotion
+        // for r2's shadow into `pending` — install hasn't happened yet.
+        std::fs::remove_dir_all(r1.path().join("Movie")).unwrap();
+        let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
+        let mut pending = Vec::new();
+        apply_snapshot(&mut tree, share, &snap_r1, 1, &cfg, &mut pending);
+        assert_eq!(pending.len(), 1, "promotion should have been deferred");
+
+        // Simulate concurrent slot fill: between apply and install, some
+        // other path inserts a file at the deferred name. The install
+        // must skip rather than try to install a duplicate.
+        let usurper_path = r1.path().join("usurper.mkv");
+        std::fs::write(&usurper_path, b"").unwrap();
+        let usurper_attrs = CachedAttrs::from_metadata(&std::fs::metadata(&usurper_path).unwrap());
+        tree.add_child(
+            share,
+            "Movie".into(),
+            NodeKind::File {
+                backing: usurper_path.clone(),
+            },
+            usurper_attrs,
+        )
+        .expect("slot is free; add must succeed");
+
+        // Run snapshot phase + install phase — the install should skip.
+        let snapshotted = snapshot_pending_promotions(pending, &cfg);
+        let retries = install_pending_promotions(&mut tree, snapshotted);
+        assert!(retries.is_empty(), "no retries expected");
+
+        // The usurper is still the owner.
+        let id = tree.child(share, "Movie").unwrap();
+        match &tree.get(id).unwrap().kind {
+            NodeKind::File { backing } => assert_eq!(*backing, usurper_path),
+            _ => panic!("usurper should still own the slot"),
+        }
+    }
+
+    #[test]
+    fn two_phase_promotion_falls_through_to_next_shadow_when_path_vanished() {
+        // Three-root deduped folder: r1 wins, r2 and r3 are both shadows.
+        // When r1 deletes AND r2's path is also gone, install should
+        // return retries that cause r3 to be promoted on the next round.
+        let r1 = TempDir::new().unwrap();
+        let r2 = TempDir::new().unwrap();
+        let r3 = TempDir::new().unwrap();
+        touch(&r1.path().join("Movie/r1.mkv"));
+        touch(&r2.path().join("Movie/r2.mkv"));
+        touch(&r3.path().join("Movie/r3.mkv"));
+        let cfg = cfg_for(BTreeMap::new());
+        let mut tree = Tree::new(0);
+        let share = tree
+            .add_child(
+                ROOT_ID,
+                "M".into(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            )
+            .unwrap();
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r1.path(), &cfg, 0).unwrap(),
+            Some(0),
+            1,
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r2.path(), &cfg, 0).unwrap(),
+            Some(0),
+            2,
+        );
+        merge_snapshot(
+            &mut tree,
+            share,
+            &snapshot_dir(r3.path(), &cfg, 0).unwrap(),
+            Some(0),
+            3,
+        );
+        tree.finalize_sort();
+
+        // Both r1 and r2 are gone before the watcher fires.
+        std::fs::remove_dir_all(r1.path().join("Movie")).unwrap();
+        std::fs::remove_dir_all(r2.path().join("Movie")).unwrap();
+
+        // Drive the loop manually: apply r1's empty snap, then snapshot
+        // and install in repeating phases.
+        let snap_r1 = snapshot_dir(r1.path(), &cfg, 0).unwrap();
+        let mut pending = Vec::new();
+        apply_snapshot(&mut tree, share, &snap_r1, 1, &cfg, &mut pending);
+        let mut iterations = 0;
+        while !pending.is_empty() {
+            iterations += 1;
+            assert!(iterations < 10, "promotion loop should terminate quickly");
+            let snapshotted = snapshot_pending_promotions(pending, &cfg);
+            pending = install_pending_promotions(&mut tree, snapshotted);
+        }
+
+        // r3 should now own the slot; r2 was tried and skipped.
+        let movie = tree
+            .child(share, "Movie")
+            .expect("r3 must be promoted after r2's path vanished");
+        assert_eq!(child_names(&tree, movie), vec!["r3.mkv".to_string()]);
     }
 
     #[test]
@@ -2114,7 +2425,7 @@ mod tests {
         }
 
         let snap2 = snapshot_dir(root.path(), &cfg, 0).unwrap();
-        apply_snapshot(&mut tree, share, &snap2, 0, &cfg);
+        apply_snapshot_inline(&mut tree, share, &snap2, 0, &cfg);
 
         let mtime_after = tree.get(share).unwrap().attrs.mtime;
         assert!(

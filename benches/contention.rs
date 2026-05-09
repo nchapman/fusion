@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 
-use fusion::builder::{apply_snapshot, merge_snapshot, snapshot_dir, DirSnapshot};
+use fusion::builder::{apply_snapshot_inline, merge_snapshot, snapshot_dir, DirSnapshot};
 use fusion::config::{Config, Options, ServerConfig, ShareConfig};
 use fusion::tree::{CachedAttrs, NodeId, NodeKind, Tree, ROOT_ID};
 use fusion::vfs::{new_file_cache, FusionFs};
@@ -138,7 +138,7 @@ fn spawn_writer_per_root(
         while !stop.load(Ordering::Relaxed) {
             for (priority, snap) in snapshots.iter().enumerate() {
                 let mut tw = tree.write().await;
-                apply_snapshot(&mut tw, share, snap, priority, &cfg);
+                apply_snapshot_inline(&mut tw, share, snap, priority, &cfg);
                 drop(tw);
                 applies += 1;
             }
@@ -163,7 +163,7 @@ fn spawn_writer_batched(
         while !stop.load(Ordering::Relaxed) {
             let mut tw = tree.write().await;
             for (priority, snap) in snapshots.iter().enumerate() {
-                apply_snapshot(&mut tw, share, snap, priority, &cfg);
+                apply_snapshot_inline(&mut tw, share, snap, priority, &cfg);
                 applies += 1;
             }
             drop(tw);

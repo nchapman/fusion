@@ -15,9 +15,25 @@
 //!                  release
 //! ```
 //!
-//! Lock-hold time is bounded by the apply phase only (no disk I/O), which
-//! keeps NFS read latency clean even during a multi-second cold scan of a
-//! spinning disk.
+//! Lock-hold time is bounded by the apply phase only (no disk I/O),
+//! which keeps NFS read latency clean even during a multi-second cold
+//! scan of a spinning disk. Shadow-directory promotion preserves the
+//! invariant via a two-phase split — the apply pass accumulates pending
+//! promotions, the lock is dropped, `snapshot_dir` runs in
+//! `spawn_blocking`, then the lock is re-acquired briefly for the
+//! RAM-only install (with a re-check in case another apply already
+//! filled the slot).
+//!
+//! Per-root lock release & partial-rescan visibility: phase 3 takes and
+//! releases the tree write lock once per applied root rather than holding
+//! it across the whole batch. NFS readers can therefore interleave
+//! between roots, and clients may briefly observe a tree state where
+//! some roots have been reconciled and others have not. To minimize the
+//! "flapping" surface, the dirty set is sorted by priority ascending so
+//! the highest-priority root applies first — a winner is never momentarily
+//! shadowed by a loser only to be re-promoted on the next sub-apply. The
+//! remaining inconsistency window is acceptable for a media file server
+//! (no transactional rescan is promised) but it is *not* zero.
 //!
 //! Backpressure: the channel is bounded. On full, events are dropped with a
 //! warn log and a `WatchSignal::RescanAll` is queued so the drainer catches
@@ -49,7 +65,10 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::builder::{apply_snapshot, snapshot_dir, DirSnapshot};
+use crate::builder::{
+    apply_snapshot, install_pending_promotions, snapshot_dir, snapshot_pending_promotions,
+    DirSnapshot, PendingPromotion,
+};
 use crate::config::Config;
 use crate::tree::{NodeId, NodeKind, Tree, ROOT_ID};
 use crate::vfs::FileCache;
@@ -70,10 +89,12 @@ enum WatchSignal {
 pub struct WatchRoot {
     pub physical: PathBuf,
     pub virtual_id: NodeId,
-    /// Index in the share's `merge` list (lower = higher precedence). Used
-    /// by `apply_snapshot` to decide whether to demote an existing winner
-    /// when this root contributes a colliding name. Subdir roots use 0 —
-    /// they never compete with merge roots, so the value is unused.
+    /// Owner priority for collision resolution (lower wins). The space
+    /// is partitioned: `0` is reserved exclusively for subdir roots, so
+    /// they always outrank any colliding merge entry without ties; merge
+    /// roots use `1..N` (their 1-based index in the share's `merge`
+    /// list). Used by `apply_snapshot` to decide whether to demote an
+    /// existing winner when this root contributes a colliding name.
     pub priority: usize,
 }
 
@@ -95,11 +116,14 @@ pub fn collect_roots(config: &Config, tree: &Tree) -> Vec<WatchRoot> {
             continue;
         };
         let share_id = *share_id;
-        for (priority, r) in share_cfg.merge.iter().enumerate() {
+        // Priority 0 is reserved for subdirs (see builder.rs ScanJob).
+        // Merges start at 1 so subdirs always outrank a colliding merge
+        // entry without ties.
+        for (idx, r) in share_cfg.merge.iter().enumerate() {
             out.push(WatchRoot {
                 physical: r.clone(),
                 virtual_id: share_id,
-                priority,
+                priority: idx + 1,
             });
         }
         let Some(share_node) = tree.get(share_id) else {
@@ -286,7 +310,7 @@ async fn drain(
         // Priority is the source root's index in its share's `merge` list;
         // `apply_snapshot` uses it to decide whether to demote an existing
         // winner that this root collides with at the same name.
-        let dirty: Vec<(PathBuf, NodeId, usize)> = if was_rescan_all {
+        let mut dirty: Vec<(PathBuf, NodeId, usize)> = if was_rescan_all {
             roots
                 .iter()
                 .map(|r| (r.physical.clone(), r.virtual_id, r.priority))
@@ -311,6 +335,12 @@ async fn drain(
             }
             out.into_iter().collect()
         };
+        // Apply higher-priority roots first so we never briefly show a
+        // loser as winner only to demote it on the next root's apply.
+        // Snapshot order is independent of apply order — sorting here is
+        // free because snapshots happen in parallel on `spawn_blocking`
+        // and join in the same order regardless.
+        dirty.sort_by_key(|&(_, _, p)| p);
 
         if dirty.is_empty() {
             continue;
@@ -360,11 +390,20 @@ async fn drain(
         // metadata RPC for the full apply duration; per-root release lets
         // readers interleave at the cost of a partially-rescanned tree being
         // briefly visible (acceptable for media — no transactional rescan).
+        //
+        // Shadow-directory promotions are *not* installed inline because
+        // their `snapshot_dir` is disk I/O. The apply phase accumulates
+        // them into `pending`; phase 3 below releases the lock, runs the
+        // disk reads, then re-acquires the lock for the install. This
+        // preserves the "no I/O under tree write lock" invariant for the
+        // bulk of the apply work while still keeping the cache always-
+        // correct (any deferred slots are filled before this batch ends).
         let apply_start = Instant::now();
+        let mut pending: Vec<PendingPromotion> = Vec::new();
         for (path, vid, prio, snap) in snapshots {
             let mut tree_w = tree.write().await;
             match snap {
-                Some(s) => apply_snapshot(&mut tree_w, vid, &s, prio, &config),
+                Some(s) => apply_snapshot(&mut tree_w, vid, &s, prio, &config, &mut pending),
                 None => {
                     // Underlying path is gone — drop our source; if the
                     // virtual dir has no sources left, remove it.
@@ -378,6 +417,46 @@ async fn drain(
             // tree_w drops here; the next iteration re-acquires.
         }
         let apply_ms = apply_start.elapsed().as_millis() as u64;
+
+        // Phase 3 — finish deferred shadow-dir promotions in two steps,
+        // preserving the "no I/O under tree write lock" invariant:
+        //   3a. With the lock dropped, run `snapshot_dir` on every loser
+        //       root path that needs promotion. spawn_blocking so disk
+        //       reads don't park the tokio runtime.
+        //   3b. Re-acquire the write lock briefly for the RAM-only
+        //       install. The install re-checks each slot in case another
+        //       apply already filled it.
+        if !pending.is_empty() {
+            let initial_count = pending.len();
+            let promote_start = Instant::now();
+            // Loop: snapshot (no lock) → install (lock) → if any retries
+            // (loser path was also gone, popped next shadow), repeat.
+            // Bounded by total shadow count per name; in practice 1–2
+            // iterations max.
+            while !pending.is_empty() {
+                let cfg_p = config.clone();
+                let to_snap = std::mem::take(&mut pending);
+                let snapshotted = match tokio::task::spawn_blocking(move || {
+                    snapshot_pending_promotions(to_snap, &cfg_p)
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(error=?e, "promotion-snapshot worker panicked; skipping");
+                        break;
+                    }
+                };
+                let mut tree_w = tree.write().await;
+                pending = install_pending_promotions(&mut tree_w, snapshotted);
+                drop(tree_w);
+            }
+            debug!(
+                count = initial_count,
+                ms = promote_start.elapsed().as_millis() as u64,
+                "installed deferred shadow-dir promotions"
+            );
+        }
 
         if was_rescan_all {
             info!(

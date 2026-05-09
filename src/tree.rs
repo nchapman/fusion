@@ -150,13 +150,14 @@ pub struct Node {
     pub kind: NodeKind,
     pub attrs: CachedAttrs,
     /// Priority of the source root that owns this node, if applicable.
-    /// `None` for synthetic dirs (root, share roots, intermediate union
-    /// dirs) and for multi-source merged directories where the entry is
-    /// genuinely shared between roots — demotion makes no sense in that
-    /// case. `Some(p)` for files (always single-owner) and for single-
-    /// source physical dirs (deduped or only-one-root contributed).
-    /// `apply_snapshot` consults this to decide whether an incoming
-    /// higher-priority root should demote the current owner.
+    /// The value spaces: `Some(0)` is reserved for subdir roots; merge
+    /// roots use `Some(1..N)` (1-based index in the share's `merge`
+    /// list); lower wins on collision. `None` for synthetic dirs (root,
+    /// share roots, intermediate union dirs) and for multi-source merged
+    /// directories where the entry is genuinely shared between roots —
+    /// demotion makes no sense in that case. `apply_snapshot` consults
+    /// this to decide whether an incoming higher-priority root should
+    /// demote the current owner.
     pub winner_priority: Option<usize>,
 }
 
