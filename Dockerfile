@@ -21,18 +21,21 @@ FROM debian:bookworm-slim
 # `gosu` drops privileges in the entrypoint after we've fixed up UIDs/perms
 # as root. `passwd` provides usermod/groupmod for the PUID/PGID dance.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates gosu passwd && \
+    apt-get install -y --no-install-recommends ca-certificates gosu passwd libcap2-bin && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -r -s /usr/sbin/nologin -u 1000 fusion
 COPY --from=builder /usr/local/bin/fusion /usr/local/bin/fusion
+# Permit non-root to bind privileged ports (portmap on 111, optional NFS on
+# 2049). Required because the entrypoint drops privs to PUID:PGID via gosu;
+# without this, only PUID=0 could bind below 1024.
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/fusion
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Default bind is 0.0.0.0:11111 (non-privileged). For production NFS on
-# port 2049 you'll need CAP_NET_BIND_SERVICE on the binary or
-# `sysctl net.ipv4.ip_unprivileged_port_start=2049` on the host, plus
-# `server.bind: 0.0.0.0:2049` in the config.
-EXPOSE 11111/tcp
+# 111 = portmap (RPC discovery, used by Infuse and other clients without a
+# port override). 11111 = default NFS bind; production deployments commonly
+# set `server.bind: 0.0.0.0:2049` in config.yaml.
+EXPOSE 111/tcp 11111/tcp
 
 ENV RUST_LOG=info
 # Entrypoint runs as root so it can usermod + chown, then drops to PUID:PGID

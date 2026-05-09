@@ -26,12 +26,18 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Bind address for the RPC portmap responder. Clients like Infuse don't
+    /// expose a port override and discover NFS via portmap on the well-known
+    /// port 111. Default `0.0.0.0:111`; set to `null` (YAML) to disable.
+    #[serde(default = "default_portmap_bind")]
+    pub portmap_bind: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            portmap_bind: default_portmap_bind(),
         }
     }
 }
@@ -40,6 +46,10 @@ fn default_bind() -> String {
     // Non-privileged port so first-run doesn't EACCES on Linux. Production
     // deployments that want 2049 set it explicitly (see README).
     "0.0.0.0:11111".to_string()
+}
+
+fn default_portmap_bind() -> Option<String> {
+    Some("0.0.0.0:111".to_string())
 }
 
 #[derive(Debug, Default)]
@@ -438,6 +448,26 @@ mod tests {
     fn default_bind_is_unprivileged_port() {
         // Default must be unprivileged so first-run doesn't fail with EACCES.
         assert_eq!(ServerConfig::default().bind, "0.0.0.0:11111");
+    }
+
+    #[test]
+    fn default_portmap_bind_is_111() {
+        // Clients without a port override (e.g. Infuse) discover NFS via
+        // portmap on 111; default must match the well-known port.
+        assert_eq!(
+            ServerConfig::default().portmap_bind.as_deref(),
+            Some("0.0.0.0:111")
+        );
+    }
+
+    #[test]
+    fn portmap_bind_can_be_disabled_via_null() {
+        let yaml = "server:\n  bind: 0.0.0.0:2049\n  portmap_bind: ~\nshares:\n  M: /tmp\n";
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.server.portmap_bind, None);
     }
 
     #[test]

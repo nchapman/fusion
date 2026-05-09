@@ -159,8 +159,37 @@ async fn main() -> Result<()> {
 
     let bind = config.server.bind.clone();
     info!(%bind, "starting NFS server");
-    let listener = NFSTcpListener::bind(&bind, FusionFs::new(tree, server_id, file_cache)).await?;
-    listener.handle_forever().await?;
+    let listener = NFSTcpListener::bind(
+        &bind,
+        FusionFs::new(tree.clone(), server_id, file_cache.clone()),
+    )
+    .await?;
+
+    // Most NFS clients (and Infuse in particular) don't expose a port override
+    // and instead discover NFS via the RPC portmap protocol on the well-known
+    // port 111. nfsserve handles portmap RPCs over whatever port we bind to,
+    // so we just stand up a second listener on 111 — same handler, same shared
+    // tree state, no special-casing. GETPORT replies with our real bind port,
+    // and the client comes back to do the actual mount/NFS work there.
+    let portmap_handle = match &config.server.portmap_bind {
+        Some(addr) => {
+            info!(bind = %addr, "starting portmap responder");
+            let portmap_fs = FusionFs::new(tree, server_id, file_cache);
+            let portmap_listener = NFSTcpListener::bind(addr, portmap_fs)
+                .await
+                .with_context(|| format!("binding portmap listener on {addr}"))?;
+            Some(tokio::spawn(async move {
+                portmap_listener.handle_forever().await
+            }))
+        }
+        None => None,
+    };
+
+    let main_result = listener.handle_forever().await;
+    if let Some(h) = portmap_handle {
+        h.abort();
+    }
+    main_result?;
     Ok(())
 }
 
