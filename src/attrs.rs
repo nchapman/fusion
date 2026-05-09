@@ -102,8 +102,10 @@ mod tests {
                 sorted: true,
                 subdir_count,
                 sources: DirSources::Synthetic,
+                shadows: None,
             },
             attrs: CachedAttrs::synthetic_dir(),
+            winner_priority: None,
         }
     }
 
@@ -119,6 +121,7 @@ mod tests {
                 backing: PathBuf::from("/x"),
             },
             attrs,
+            winner_priority: None,
         }
     }
 

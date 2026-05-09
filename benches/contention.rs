@@ -63,6 +63,7 @@ struct BenchSetup {
     snapshots: Vec<Arc<DirSnapshot>>,
     needle: filename3,
     fid: NodeId,
+    cfg: Arc<Config>,
 }
 
 /// Build a tree backed by `ROOT_COUNT` physical directories, each holding
@@ -97,8 +98,8 @@ fn setup() -> BenchSetup {
             CachedAttrs::synthetic_dir(),
         )
         .unwrap();
-    for snap in &snapshots {
-        merge_snapshot(&mut tree, share, snap, None);
+    for (priority, snap) in snapshots.iter().enumerate() {
+        merge_snapshot(&mut tree, share, snap, None, priority);
     }
     tree.finalize_sort();
 
@@ -118,6 +119,7 @@ fn setup() -> BenchSetup {
         snapshots: snapshots.into_iter().map(Arc::new).collect(),
         needle,
         fid,
+        cfg: Arc::new(cfg),
     }
 }
 
@@ -129,13 +131,14 @@ fn spawn_writer_per_root(
     share: NodeId,
     snapshots: Vec<Arc<DirSnapshot>>,
     stop: Arc<AtomicBool>,
+    cfg: Arc<Config>,
 ) -> tokio::task::JoinHandle<u64> {
     rt.spawn(async move {
         let mut applies: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
-            for snap in &snapshots {
+            for (priority, snap) in snapshots.iter().enumerate() {
                 let mut tw = tree.write().await;
-                apply_snapshot(&mut tw, share, snap);
+                apply_snapshot(&mut tw, share, snap, priority, &cfg);
                 drop(tw);
                 applies += 1;
             }
@@ -153,13 +156,14 @@ fn spawn_writer_batched(
     share: NodeId,
     snapshots: Vec<Arc<DirSnapshot>>,
     stop: Arc<AtomicBool>,
+    cfg: Arc<Config>,
 ) -> tokio::task::JoinHandle<u64> {
     rt.spawn(async move {
         let mut applies: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
             let mut tw = tree.write().await;
-            for snap in &snapshots {
-                apply_snapshot(&mut tw, share, snap);
+            for (priority, snap) in snapshots.iter().enumerate() {
+                apply_snapshot(&mut tw, share, snap, priority, &cfg);
                 applies += 1;
             }
             drop(tw);
@@ -187,6 +191,7 @@ fn bench_lookup(c: &mut Criterion) {
         share,
         snapshots,
         needle,
+        cfg,
         ..
     } = setup();
     let needle = Arc::new(needle);
@@ -208,7 +213,14 @@ fn bench_lookup(c: &mut Criterion) {
 
     // Per-root release (current production code path).
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer_per_root(&rt, tree.clone(), share, snapshots.clone(), stop.clone());
+    let writer = spawn_writer_per_root(
+        &rt,
+        tree.clone(),
+        share,
+        snapshots.clone(),
+        stop.clone(),
+        cfg.clone(),
+    );
     {
         let fs = fs.clone();
         let needle = needle.clone();
@@ -225,7 +237,7 @@ fn bench_lookup(c: &mut Criterion) {
 
     // Batched (the pre-optimization shape — for comparison only).
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer_batched(&rt, tree, share, snapshots, stop.clone());
+    let writer = spawn_writer_batched(&rt, tree, share, snapshots, stop.clone(), cfg);
     {
         let fs = fs.clone();
         let needle = needle.clone();
@@ -254,6 +266,7 @@ fn bench_getattr(c: &mut Criterion) {
         share,
         snapshots,
         fid,
+        cfg,
         ..
     } = setup();
     let fs = Arc::new(fs);
@@ -271,7 +284,14 @@ fn bench_getattr(c: &mut Criterion) {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer_per_root(&rt, tree.clone(), share, snapshots.clone(), stop.clone());
+    let writer = spawn_writer_per_root(
+        &rt,
+        tree.clone(),
+        share,
+        snapshots.clone(),
+        stop.clone(),
+        cfg.clone(),
+    );
     {
         let fs = fs.clone();
         group.bench_function("under_per_root_apply", |b| {
@@ -285,7 +305,7 @@ fn bench_getattr(c: &mut Criterion) {
     let applies_pr = rt.block_on(async { writer.await.unwrap() });
 
     let stop = Arc::new(AtomicBool::new(false));
-    let writer = spawn_writer_batched(&rt, tree, share, snapshots, stop.clone());
+    let writer = spawn_writer_batched(&rt, tree, share, snapshots, stop.clone(), cfg);
     {
         let fs = fs.clone();
         group.bench_function("under_batched_apply", |b| {

@@ -64,11 +64,17 @@ enum WatchSignal {
     RescanAll,
 }
 
-/// Information about a watched root: which virtual directory it feeds.
+/// Information about a watched root: which virtual directory it feeds and
+/// where it ranks among its peers.
 #[derive(Clone, Debug)]
 pub struct WatchRoot {
     pub physical: PathBuf,
     pub virtual_id: NodeId,
+    /// Index in the share's `merge` list (lower = higher precedence). Used
+    /// by `apply_snapshot` to decide whether to demote an existing winner
+    /// when this root contributes a colliding name. Subdir roots use 0 —
+    /// they never compete with merge roots, so the value is unused.
+    pub priority: usize,
 }
 
 /// Collect every (physical_root, virtual_id) pair to watch. Call this against
@@ -89,10 +95,11 @@ pub fn collect_roots(config: &Config, tree: &Tree) -> Vec<WatchRoot> {
             continue;
         };
         let share_id = *share_id;
-        for r in &share_cfg.merge {
+        for (priority, r) in share_cfg.merge.iter().enumerate() {
             out.push(WatchRoot {
                 physical: r.clone(),
                 virtual_id: share_id,
+                priority,
             });
         }
         let Some(share_node) = tree.get(share_id) else {
@@ -106,6 +113,7 @@ pub fn collect_roots(config: &Config, tree: &Tree) -> Vec<WatchRoot> {
                 out.push(WatchRoot {
                     physical: r.clone(),
                     virtual_id: *subdir_id,
+                    priority: 0,
                 });
             }
         }
@@ -240,6 +248,14 @@ impl Watcher {
         }
         info!(count = roots.len(), "watching roots");
 
+        // Close the build/notify-attach race: notify only surfaces events
+        // after `watch()` returns. Anything written to disk between `build()`
+        // completing and now would otherwise be invisible until the periodic
+        // rescan (24h default). Send one `RescanAll` so the drainer
+        // re-snapshots everything before the first NFS RPC can observe a
+        // gap. `try_send` because the channel was just drained.
+        let _ = tx.try_send(WatchSignal::RescanAll);
+
         Ok(Self {
             _debouncer: debouncer,
             periodic,
@@ -266,11 +282,14 @@ async fn drain(
         }
         let was_rescan_all = signals.iter().any(|s| matches!(s, WatchSignal::RescanAll));
 
-        // 2. Compute the dirty (root_path, virtual_id) set.
-        let dirty: Vec<(PathBuf, NodeId)> = if was_rescan_all {
+        // 2. Compute the dirty set: (root_path, virtual_id, root_priority).
+        // Priority is the source root's index in its share's `merge` list;
+        // `apply_snapshot` uses it to decide whether to demote an existing
+        // winner that this root collides with at the same name.
+        let dirty: Vec<(PathBuf, NodeId, usize)> = if was_rescan_all {
             roots
                 .iter()
-                .map(|r| (r.physical.clone(), r.virtual_id))
+                .map(|r| (r.physical.clone(), r.virtual_id, r.priority))
                 .collect()
         } else {
             let paths: HashSet<PathBuf> = signals
@@ -282,7 +301,7 @@ async fn drain(
                 .collect();
             // Read lock briefly to consult path_index.
             let tree_r = tree.read().await;
-            let mut out: HashSet<(PathBuf, NodeId)> = HashSet::new();
+            let mut out: HashSet<(PathBuf, NodeId, usize)> = HashSet::new();
             for path in &paths {
                 if let Some(d) = route_path(path, &roots, &tree_r) {
                     out.insert(d);
@@ -305,16 +324,16 @@ async fn drain(
         // time.
         let snap_start = Instant::now();
         let cfg_b = config.clone();
-        let snapshots: Vec<(PathBuf, NodeId, Option<DirSnapshot>)> =
+        let snapshots: Vec<(PathBuf, NodeId, usize, Option<DirSnapshot>)> =
             match tokio::task::spawn_blocking(move || {
                 let cfg: &Config = &cfg_b;
                 std::thread::scope(|s| {
                     let handles: Vec<_> = dirty
                         .into_iter()
-                        .map(|(path, vid)| {
+                        .map(|(path, vid, prio)| {
                             s.spawn(move || {
                                 let snap = snapshot_dir(&path, cfg, 0);
-                                (path, vid, snap)
+                                (path, vid, prio, snap)
                             })
                         })
                         .collect();
@@ -342,10 +361,10 @@ async fn drain(
         // readers interleave at the cost of a partially-rescanned tree being
         // briefly visible (acceptable for media — no transactional rescan).
         let apply_start = Instant::now();
-        for (path, vid, snap) in snapshots {
+        for (path, vid, prio, snap) in snapshots {
             let mut tree_w = tree.write().await;
             match snap {
-                Some(s) => apply_snapshot(&mut tree_w, vid, &s),
+                Some(s) => apply_snapshot(&mut tree_w, vid, &s, prio, &config),
                 None => {
                     // Underlying path is gone — drop our source; if the
                     // virtual dir has no sources left, remove it.
@@ -381,15 +400,20 @@ async fn drain(
 
 /// Route an event path to the deepest watched virtual directory: walk up
 /// ancestors, looking each up in `path_index`; on miss fall back to the
-/// configured watch roots' longest prefix match.
-fn route_path(path: &Path, roots: &[WatchRoot], tree: &Tree) -> Option<(PathBuf, NodeId)> {
+/// configured watch roots' longest prefix match. Returns
+/// `(snapshot_root_path, virtual_id, root_priority)` — the priority is
+/// taken from the watch root whose physical path is the longest prefix
+/// of the resolved path, since `path_index` doesn't carry source-root
+/// identity by itself.
+fn route_path(path: &Path, roots: &[WatchRoot], tree: &Tree) -> Option<(PathBuf, NodeId, usize)> {
     let mut p = path;
     loop {
         if let Some(vid) = tree.lookup_path(p) {
             // Only route to dirs (path_index also contains files).
             if let Some(node) = tree.get(vid) {
                 if node.is_dir() {
-                    return Some((p.to_path_buf(), vid));
+                    let priority = match_root_prefix(roots, p).map(|r| r.priority).unwrap_or(0);
+                    return Some((p.to_path_buf(), vid, priority));
                 }
             }
         }
@@ -398,7 +422,7 @@ fn route_path(path: &Path, roots: &[WatchRoot], tree: &Tree) -> Option<(PathBuf,
             _ => break,
         }
     }
-    match_root_prefix(roots, path).map(|r| (r.physical.clone(), r.virtual_id))
+    match_root_prefix(roots, path).map(|r| (r.physical.clone(), r.virtual_id, r.priority))
 }
 
 fn match_root_prefix<'a>(roots: &'a [WatchRoot], path: &Path) -> Option<&'a WatchRoot> {
@@ -503,10 +527,12 @@ mod tests {
             WatchRoot {
                 physical: PathBuf::from("/m"),
                 virtual_id: 10,
+                priority: 0,
             },
             WatchRoot {
                 physical: PathBuf::from("/m/sub"),
                 virtual_id: 20,
+                priority: 1,
             },
         ];
         let r = match_root_prefix(&roots, Path::new("/m/sub/x")).unwrap();
@@ -518,6 +544,7 @@ mod tests {
         let roots = vec![WatchRoot {
             physical: PathBuf::from("/m"),
             virtual_id: 10,
+            priority: 0,
         }];
         assert!(match_root_prefix(&roots, Path::new("/other/x")).is_none());
     }
@@ -807,6 +834,45 @@ mod tests {
         let cache = new_file_cache();
         let watcher = Watcher::start(cfg, tree.clone(), roots, cache).unwrap();
         (tree, watcher)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_rescan_picks_up_file_added_before_watch_attached() {
+        // The periodic-rescan test below proves the 24h safety net catches
+        // pre-watch changes eventually. This test asserts the *immediate*
+        // catch via the startup `RescanAll` emitted at the end of
+        // `Watcher::start` — without it, files added between `build()`
+        // completing and `notify::watch()` attaching are invisible until
+        // the next periodic tick. Disable the periodic to isolate the
+        // startup signal.
+        let m = TempDir::new().unwrap();
+        let mut cfg_inner = cfg_with(one_merge_share("S", m.path()));
+        cfg_inner.options.rescan_interval = Duration::ZERO; // disable periodic
+        let cfg = Arc::new(cfg_inner);
+        let tree = Arc::new(RwLock::new(build(&cfg, 0).unwrap()));
+        let roots = collect_roots(&cfg, &*tree.read().await);
+        let cache = new_file_cache();
+
+        // Add a file BEFORE attaching notify. The startup RescanAll should
+        // pick it up within the first drain pass.
+        std::fs::write(m.path().join("late.mkv"), b"").unwrap();
+        let _watcher = Watcher::start(cfg, tree.clone(), roots, cache).unwrap();
+
+        // Generous deadline absorbs CI variance; local runs converge in ms.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let t = tree.read().await;
+                let s = t.child(ROOT_ID, "S").unwrap();
+                if t.child(s, "late.mkv").is_some() {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("startup rescan did not pick up pre-watch file within 5s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

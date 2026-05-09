@@ -27,6 +27,16 @@ pub struct CachedAttrs {
 }
 
 impl CachedAttrs {
+    /// True iff the fields a NFS client can observe and revalidate against
+    /// differ. NFSv3 clients key dentry-cache freshness on mtime and act on
+    /// size + mode for getattr; ctime/atime are not load-bearing for cache
+    /// invalidation here. Centralizing the comparison keeps the in-place
+    /// attrs-update branches in `apply_snapshot` from drifting (e.g. by
+    /// silently ignoring `chmod`).
+    pub fn differs_visibly(&self, other: &CachedAttrs) -> bool {
+        self.size != other.size || self.mtime != other.mtime || self.mode != other.mode
+    }
+
     pub fn synthetic_dir() -> Self {
         let now = SystemTime::now();
         Self {
@@ -67,10 +77,44 @@ pub enum NodeKind {
         /// makes `find` miss subdirectories.
         subdir_count: u32,
         sources: DirSources,
+        /// Losers at each name: files and directories that didn't win the
+        /// initial collision but should be promoted if the current winner
+        /// disappears. Boxed + lazily allocated so directories without any
+        /// collisions (the common case) pay only one pointer of overhead,
+        /// and the `Directory` variant stays a similar size to `File`.
+        shadows: Option<Box<DirShadows>>,
     },
     File {
         backing: PathBuf,
     },
+}
+
+/// Per-directory shadow data. Allocated only when a name actually has a
+/// shadow recorded; cleared back to `None` once the last shadow is popped.
+#[derive(Debug, Default)]
+pub struct DirShadows {
+    /// Sorted ascending by priority (position 0 = highest precedence).
+    pub files: FastMap<String, Vec<ShadowFile>>,
+    pub dirs: FastMap<String, Vec<ShadowDir>>,
+}
+
+/// A losing file at a name in a virtual directory. Records enough to install
+/// the file as a winner if the current winner disappears.
+#[derive(Debug, Clone)]
+pub struct ShadowFile {
+    /// Index of the source root in its share's `merge` list. Lower wins.
+    pub priority: usize,
+    pub backing: PathBuf,
+    pub attrs: CachedAttrs,
+}
+
+/// A losing directory at a name in a virtual directory. Stores only the
+/// physical path of the loser root — the subtree is re-snapshotted from
+/// disk if/when the shadow is promoted.
+#[derive(Debug, Clone)]
+pub struct ShadowDir {
+    pub priority: usize,
+    pub physical: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +137,7 @@ impl NodeKind {
             sorted: true,
             subdir_count: 0,
             sources: DirSources::Synthetic,
+            shadows: None,
         }
     }
 }
@@ -104,6 +149,15 @@ pub struct Node {
     pub name: String,
     pub kind: NodeKind,
     pub attrs: CachedAttrs,
+    /// Priority of the source root that owns this node, if applicable.
+    /// `None` for synthetic dirs (root, share roots, intermediate union
+    /// dirs) and for multi-source merged directories where the entry is
+    /// genuinely shared between roots — demotion makes no sense in that
+    /// case. `Some(p)` for files (always single-owner) and for single-
+    /// source physical dirs (deduped or only-one-root contributed).
+    /// `apply_snapshot` consults this to decide whether an incoming
+    /// higher-priority root should demote the current owner.
+    pub winner_priority: Option<usize>,
 }
 
 impl Node {
@@ -135,8 +189,10 @@ impl Tree {
                 sorted: true,
                 subdir_count: 0,
                 sources: DirSources::Synthetic,
+                shadows: None,
             },
             attrs: CachedAttrs::synthetic_dir(),
+            winner_priority: None,
         };
         Self {
             nodes: vec![None, Some(root)],
@@ -192,6 +248,7 @@ impl Tree {
             name: name.clone(),
             kind,
             attrs,
+            winner_priority: None,
         };
         self.nodes[id as usize] = Some(node);
 
@@ -336,6 +393,10 @@ impl Tree {
     /// a second merge root contributes to an existing union dir). No-op if
     /// `id` no longer exists in the tree (e.g. caller passed a stale id from
     /// a snapshot taken before another apply removed the subtree).
+    ///
+    /// As soon as a directory has more than one source, its
+    /// `winner_priority` is cleared: a merged dir is genuinely shared and
+    /// has no single owner to demote.
     pub fn extend_dir_sources(&mut self, id: NodeId, path: PathBuf) {
         let Some(node) = self.get_mut(id) else { return };
         let NodeKind::Directory { sources, .. } = &mut node.kind else {
@@ -348,12 +409,23 @@ impl Tree {
             DirSources::Physical(v) => {
                 if !v.contains(&path) {
                     v.push(path.clone());
+                    if v.len() > 1 {
+                        node.winner_priority = None;
+                    }
                 }
             }
         }
         // Index only after the node is confirmed present — otherwise we'd
         // leave a `path_index` entry pointing at a `None` slot.
         self.path_index.insert(path, id);
+    }
+
+    /// Set the owner-priority of a node (typically right after `add_child`).
+    /// `None` is appropriate for synthetic nodes and merged dirs.
+    pub fn set_winner_priority(&mut self, id: NodeId, priority: Option<usize>) {
+        if let Some(node) = self.get_mut(id) {
+            node.winner_priority = priority;
+        }
     }
 
     pub fn node_count(&self) -> usize {
@@ -395,6 +467,125 @@ impl Tree {
             self.path_index.remove(path);
         }
         now_empty
+    }
+
+    /// Record a losing file under `name` at directory `parent`. Insert is
+    /// stable-sorted by ascending priority (position 0 = highest priority).
+    /// Existing entries from the same root are replaced rather than
+    /// duplicated, so a re-applied merge of the same root doesn't grow the
+    /// shadow list unboundedly.
+    pub fn add_shadow_file(&mut self, parent: NodeId, name: &str, shadow: ShadowFile) {
+        let Some(node) = self.get_mut(parent) else {
+            return;
+        };
+        let NodeKind::Directory { shadows, .. } = &mut node.kind else {
+            return;
+        };
+        let list = shadows
+            .get_or_insert_with(|| Box::new(DirShadows::default()))
+            .files
+            .entry(name.to_string())
+            .or_default();
+        list.retain(|s| s.priority != shadow.priority);
+        let pos = list
+            .binary_search_by(|s| s.priority.cmp(&shadow.priority))
+            .unwrap_or_else(|p| p);
+        list.insert(pos, shadow);
+    }
+
+    /// Record a losing directory under `name` at directory `parent`. Same
+    /// dedup-by-priority semantics as `add_shadow_file`.
+    pub fn add_shadow_dir(&mut self, parent: NodeId, name: &str, shadow: ShadowDir) {
+        let Some(node) = self.get_mut(parent) else {
+            return;
+        };
+        let NodeKind::Directory { shadows, .. } = &mut node.kind else {
+            return;
+        };
+        let list = shadows
+            .get_or_insert_with(|| Box::new(DirShadows::default()))
+            .dirs
+            .entry(name.to_string())
+            .or_default();
+        list.retain(|s| s.priority != shadow.priority);
+        let pos = list
+            .binary_search_by(|s| s.priority.cmp(&shadow.priority))
+            .unwrap_or_else(|p| p);
+        list.insert(pos, shadow);
+    }
+
+    /// Pop the highest-priority file shadow for `name` (if any). Used when a
+    /// winner is removed and we want to promote a loser into its place.
+    pub fn pop_shadow_file(&mut self, parent: NodeId, name: &str) -> Option<ShadowFile> {
+        let node = self.get_mut(parent)?;
+        let NodeKind::Directory { shadows, .. } = &mut node.kind else {
+            return None;
+        };
+        let s = shadows.as_deref_mut()?;
+        let list = s.files.get_mut(name)?;
+        let popped = if list.is_empty() {
+            None
+        } else {
+            Some(list.remove(0))
+        };
+        if list.is_empty() {
+            s.files.remove(name);
+        }
+        if s.files.is_empty() && s.dirs.is_empty() {
+            *shadows = None;
+        }
+        popped
+    }
+
+    /// Pop the highest-priority directory shadow for `name` (if any).
+    pub fn pop_shadow_dir(&mut self, parent: NodeId, name: &str) -> Option<ShadowDir> {
+        let node = self.get_mut(parent)?;
+        let NodeKind::Directory { shadows, .. } = &mut node.kind else {
+            return None;
+        };
+        let s = shadows.as_deref_mut()?;
+        let list = s.dirs.get_mut(name)?;
+        let popped = if list.is_empty() {
+            None
+        } else {
+            Some(list.remove(0))
+        };
+        if list.is_empty() {
+            s.dirs.remove(name);
+        }
+        if s.files.is_empty() && s.dirs.is_empty() {
+            *shadows = None;
+        }
+        popped
+    }
+
+    /// Remove all shadow entries (file and dir) at `name` matching `priority`.
+    /// Used when a losing root deletes its own copy of a shadowed name.
+    pub fn remove_shadows_for_priority(&mut self, parent: NodeId, name: &str, priority: usize) {
+        let Some(node) = self.get_mut(parent) else {
+            return;
+        };
+        let NodeKind::Directory { shadows, .. } = &mut node.kind else {
+            return;
+        };
+        let Some(s) = shadows.as_deref_mut() else {
+            return;
+        };
+        if let Some(list) = s.files.get_mut(name) {
+            list.retain(|x| x.priority != priority);
+            if list.is_empty() {
+                s.files.remove(name);
+            }
+        }
+        if let Some(list) = s.dirs.get_mut(name) {
+            list.retain(|x| x.priority != priority);
+            if list.is_empty() {
+                s.dirs.remove(name);
+            }
+        }
+        if s.files.is_empty() && s.dirs.is_empty() {
+            *shadows = None;
+        }
     }
 }
 
