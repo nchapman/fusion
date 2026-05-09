@@ -2,16 +2,7 @@
 //!
 //! Nodes are stored in a flat `Vec<Option<Node>>` indexed by `NodeId`.
 //! `NodeId` doubles as the NFS `fileid3`. Index 0 is reserved (NFS forbids
-//! fileid 0). Index 1 (`INTERNAL_ROOT_ID`) is a hidden placeholder that
-//! exists only because some NFS implementations assume fileid 1 is special;
-//! clients never see it. Index 2 (`ROOT_ID`) is the *exposed* mount root —
-//! a regular synthetic interior dir whose parent is the hidden placeholder.
-//!
-//! Why two roots: Infuse's NFS client appears to have a bug where mounting
-//! a server's true root (the fh that nfsserve labels as the root sentinel)
-//! triggers an infinite "/" navigation loop. Mounting any *interior* dir
-//! works fine. By making the exposed root structurally identical to an
-//! interior dir, we sidestep the bug. macOS, Linux, etc. don't care.
+//! fileid 0); index 1 is always the root.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,12 +15,7 @@ pub type FastMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 pub type NodeId = u64;
 
-/// Hidden placeholder at fileid 1. Holds `ROOT_ID` as its only child.
-/// Never returned to NFS clients.
-pub const INTERNAL_ROOT_ID: NodeId = 1;
-/// The mount root exposed via NFS. Children added here become the top-level
-/// entries clients see when they mount `/`.
-pub const ROOT_ID: NodeId = 2;
+pub const ROOT_ID: NodeId = 1;
 
 #[derive(Debug, Clone)]
 pub struct CachedAttrs {
@@ -194,34 +180,9 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(server_id: u64) -> Self {
-        // INTERNAL_ROOT_ID (1): hidden placeholder. Has ROOT_ID as its sole
-        // child and a `subdir_count` of 1 so its nlink is correct if any
-        // client ever happens to GETATTR it. Otherwise unreachable.
-        let mut by_name = FastMap::default();
-        by_name.insert(String::new(), ROOT_ID);
-        let internal_root = Node {
-            id: INTERNAL_ROOT_ID,
-            parent: None,
-            name: String::new(),
-            kind: NodeKind::Directory {
-                by_name,
-                ordered: vec![(String::new(), ROOT_ID)],
-                sorted: true,
-                subdir_count: 1,
-                sources: DirSources::Synthetic,
-                shadows: None,
-            },
-            attrs: CachedAttrs::synthetic_dir(),
-            winner_priority: None,
-        };
-        // ROOT_ID (2): the exposed mount root. Structurally a normal
-        // interior synthetic dir — same shape as any wrapper share built
-        // via `subdirs:`. Parent points at the hidden placeholder so the
-        // tree is well-formed; clients never traverse there because vfs's
-        // `..` handler returns ROOT_ID itself for ROOT_ID (RFC convention).
         let root = Node {
             id: ROOT_ID,
-            parent: Some(INTERNAL_ROOT_ID),
+            parent: None,
             name: String::new(),
             kind: NodeKind::Directory {
                 by_name: FastMap::default(),
@@ -235,7 +196,7 @@ impl Tree {
             winner_priority: None,
         };
         Self {
-            nodes: vec![None, Some(internal_root), Some(root)],
+            nodes: vec![None, Some(root)],
             path_index: FastMap::default(),
             server_id,
         }
@@ -359,7 +320,7 @@ impl Tree {
     /// Recursively remove a node and its descendants. Returns the number of
     /// nodes removed. Also clears `path_index` entries for files removed.
     pub fn remove_recursive(&mut self, id: NodeId) -> usize {
-        if id == ROOT_ID || id == INTERNAL_ROOT_ID {
+        if id == ROOT_ID {
             return 0;
         }
         let mut removed = 0;
@@ -663,43 +624,13 @@ mod tests {
         let tree = Tree::new(42);
         let root = tree.get(ROOT_ID).expect("root present");
         assert!(root.is_dir());
-        // ROOT_ID is the *exposed* mount root; structurally an interior dir
-        // with the hidden placeholder as its parent. See the module docs
-        // for why the two-root shape exists.
-        assert_eq!(root.parent, Some(INTERNAL_ROOT_ID));
+        assert_eq!(root.parent, None);
         match &root.kind {
             NodeKind::Directory { sources, .. } => {
                 assert!(matches!(sources, DirSources::Synthetic));
             }
             _ => panic!("root should be a dir"),
         }
-    }
-
-    #[test]
-    fn internal_root_holds_mount_root_as_only_child() {
-        let tree = Tree::new(0);
-        let internal = tree.get(INTERNAL_ROOT_ID).expect("internal root present");
-        assert_eq!(internal.parent, None);
-        match &internal.kind {
-            NodeKind::Directory {
-                ordered,
-                subdir_count,
-                ..
-            } => {
-                assert_eq!(*subdir_count, 1);
-                assert_eq!(ordered.len(), 1);
-                assert_eq!(ordered[0].1, ROOT_ID);
-            }
-            _ => panic!("internal root should be a dir"),
-        }
-    }
-
-    #[test]
-    fn remove_recursive_internal_root_is_noop() {
-        let mut tree = Tree::new(0);
-        assert_eq!(tree.remove_recursive(INTERNAL_ROOT_ID), 0);
-        assert!(tree.get(INTERNAL_ROOT_ID).is_some());
-        assert!(tree.get(ROOT_ID).is_some());
     }
 
     #[test]
