@@ -56,8 +56,11 @@ fn default_portmap_bind() -> Option<String> {
 pub struct ShareConfig {
     /// Roots that union into the share root.
     pub merge: Vec<PathBuf>,
-    /// Roots that appear as named subdirectories of the share.
-    pub subdirs: BTreeMap<String, PathBuf>,
+    /// Named subdirectories of this share. Each subdir is itself a
+    /// share-shaped config — it can have its own `merge` roots, its own
+    /// `dedupe_depth`, and (recursively) further subdirs. The minimal form
+    /// (a single path) is sugar for `{ merge: [path] }`.
+    pub subdirs: BTreeMap<String, ShareConfig>,
     /// Folder-level dedupe depth for `merge` roots. `None` (default) recurses
     /// forever so directory trees fully union. `Some(N)` stops merging at
     /// depth N: a directory whose name was first claimed by an earlier root
@@ -83,6 +86,10 @@ pub struct ShareConfig {
 ///   `Movies: [/mnt/d1, /mnt/d2]`            → multiple merge roots
 ///   `Movies: { merge: [...], subdirs: {…} }` → full form
 ///
+/// The schema is recursive: each value inside `subdirs` accepts the same
+/// three forms, so a subdir can itself be a multi-root merge with its own
+/// `dedupe_depth`.
+///
 /// `mount` is captured to produce a clear migration error — pre-rename
 /// configs would otherwise silently parse as an empty share.
 #[derive(Deserialize)]
@@ -94,7 +101,7 @@ enum ShareSpec {
         #[serde(default)]
         merge: Vec<PathBuf>,
         #[serde(default)]
-        subdirs: BTreeMap<String, PathBuf>,
+        subdirs: BTreeMap<String, ShareSpec>,
         #[serde(default)]
         dedupe_depth: Option<usize>,
         #[serde(default, rename = "mount")]
@@ -125,11 +132,20 @@ impl ShareSpec {
                 subdirs,
                 dedupe_depth,
                 ..
-            } => Ok(ShareConfig {
-                merge,
-                subdirs,
-                dedupe_depth,
-            }),
+            } => {
+                let subdirs = subdirs
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let qualified = format!("{share_name}/{k}");
+                        v.into_config(&qualified).map(|cfg| (k, cfg))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                Ok(ShareConfig {
+                    merge,
+                    subdirs,
+                    dedupe_depth,
+                })
+            }
         }
     }
 }
@@ -243,17 +259,18 @@ impl Config {
     /// our `path_index` keys won't match the events we receive. Missing roots
     /// stay un-canonicalized — they're surfaced by `warn_on_missing_roots`.
     fn canonicalize_roots(&mut self) {
-        for share in self.shares.values_mut() {
+        fn walk(share: &mut ShareConfig) {
             for p in share.merge.iter_mut() {
                 if let Ok(c) = p.canonicalize() {
                     *p = c;
                 }
             }
-            for p in share.subdirs.values_mut() {
-                if let Ok(c) = p.canonicalize() {
-                    *p = c;
-                }
+            for sub in share.subdirs.values_mut() {
+                walk(sub);
             }
+        }
+        for share in self.shares.values_mut() {
+            walk(share);
         }
     }
 
@@ -263,26 +280,22 @@ impl Config {
     /// come and go (USB media, network mounts) and the watcher will pick up
     /// the path when it appears.
     fn warn_on_missing_roots(&self) {
-        for (name, share) in &self.shares {
+        fn walk(label: &str, share: &ShareConfig) {
             for p in &share.merge {
                 if !p.exists() {
                     warn!(
-                        share = %name,
+                        share = label,
                         path = %p.display(),
                         "merge root does not exist; share will be empty until path appears"
                     );
                 }
             }
-            for (sname, p) in &share.subdirs {
-                if !p.exists() {
-                    warn!(
-                        share = %name,
-                        subdir = %sname,
-                        path = %p.display(),
-                        "subdir root does not exist; subdir will be empty until path appears"
-                    );
-                }
+            for (sname, sub) in &share.subdirs {
+                walk(&format!("{label}/{sname}"), sub);
             }
+        }
+        for (name, share) in &self.shares {
+            walk(name, share);
         }
     }
 
@@ -290,19 +303,19 @@ impl Config {
     /// do anything useful. Kept separate from `validate` (which bails) and
     /// `warn_on_missing_roots` (which is about disk state).
     fn warn_on_unusual_share_options(&self) {
-        for (name, share) in &self.shares {
+        fn walk(label: &str, share: &ShareConfig) {
             if share.dedupe_depth.is_some() && share.merge.len() < 2 {
                 warn!(
-                    share = %name,
+                    share = label,
                     "dedupe_depth has no effect with fewer than two merge roots; ignoring"
                 );
             }
-            if share.dedupe_depth.is_some() && !share.subdirs.is_empty() {
-                warn!(
-                    share = %name,
-                    "dedupe_depth applies to `merge` roots only; `subdirs` are unaffected"
-                );
+            for (sname, sub) in &share.subdirs {
+                walk(&format!("{label}/{sname}"), sub);
             }
+        }
+        for (name, share) in &self.shares {
+            walk(name, share);
         }
     }
 
@@ -310,52 +323,54 @@ impl Config {
         if self.shares.is_empty() {
             anyhow::bail!("config has no shares");
         }
-        for (name, share) in &self.shares {
-            if !is_valid_path_segment(name) {
-                anyhow::bail!("invalid share name {name:?}");
-            }
+        fn walk(label: &str, share: &ShareConfig) -> Result<()> {
             if share.merge.is_empty() && share.subdirs.is_empty() {
-                anyhow::bail!("share {name} has no merge or subdirs roots");
+                anyhow::bail!("share {label} has no merge or subdirs roots");
             }
             for p in &share.merge {
                 if !p.is_absolute() {
-                    anyhow::bail!("share {name} merge root {} must be absolute", p.display());
-                }
-            }
-            for (sname, p) in &share.subdirs {
-                if !is_valid_path_segment(sname) {
-                    anyhow::bail!("share {name} has invalid subdir name {sname:?}");
-                }
-                if !p.is_absolute() {
-                    anyhow::bail!(
-                        "share {name} subdir {sname} root {} must be absolute",
-                        p.display()
-                    );
+                    anyhow::bail!("share {label} merge root {} must be absolute", p.display());
                 }
             }
             if let Some(0) = share.dedupe_depth {
                 anyhow::bail!(
-                    "share {name} has dedupe_depth: 0; use 1 or higher \
+                    "share {label} has dedupe_depth: 0; use 1 or higher \
                      (1 dedupes at the share's top-level folders)"
                 );
             }
             // Reject overlapping merge roots within a share. The union is
-            // ambiguous (which root "wins" a file inside the overlap?) and the
-            // watcher would double-fire on every event under the inner path.
+            // ambiguous (which root "wins" a file inside the overlap?) and
+            // the watcher would double-fire on every event under the inner
+            // path. Subdirs are checked recursively in their own scope —
+            // overlap *across* a share and one of its subdirs is allowed
+            // (subdirs win at their slot by design).
             for (i, a) in share.merge.iter().enumerate() {
                 for b in share.merge.iter().skip(i + 1) {
                     if a == b {
-                        anyhow::bail!("share {name} merge root {} listed twice", a.display());
+                        anyhow::bail!("share {label} merge root {} listed twice", a.display());
                     }
                     if a.starts_with(b) || b.starts_with(a) {
                         anyhow::bail!(
-                            "share {name} merge roots overlap: {} and {}",
+                            "share {label} merge roots overlap: {} and {}",
                             a.display(),
                             b.display()
                         );
                     }
                 }
             }
+            for (sname, sub) in &share.subdirs {
+                if !is_valid_path_segment(sname) {
+                    anyhow::bail!("share {label} has invalid subdir name {sname:?}");
+                }
+                walk(&format!("{label}/{sname}"), sub)?;
+            }
+            Ok(())
+        }
+        for (name, share) in &self.shares {
+            if !is_valid_path_segment(name) {
+                anyhow::bail!("invalid share name {name:?}");
+            }
+            walk(name, share)?;
         }
         Ok(())
     }
@@ -425,7 +440,15 @@ mod tests {
             merge: merge.iter().map(PathBuf::from).collect(),
             subdirs: subdirs
                 .iter()
-                .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        ShareConfig {
+                            merge: vec![PathBuf::from(v)],
+                            ..Default::default()
+                        },
+                    )
+                })
                 .collect(),
             dedupe_depth: None,
         }
@@ -709,6 +732,50 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).expect("load");
         assert_eq!(cfg.shares["Movies"].dedupe_depth, Some(1));
+    }
+
+    #[test]
+    fn load_parses_subdir_with_merge_and_dedupe_depth() {
+        // The Infuse-friendly shape: an outer wrapper share whose subdir
+        // is itself a multi-root merge with folder-level dedupe.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  \
+             Library:\n    \
+             subdirs:\n      \
+             Movies:\n        \
+             merge:\n          \
+             - /tmp/a\n          \
+             - /tmp/b\n        \
+             dedupe_depth: 1\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        let library = &cfg.shares["Library"];
+        assert!(library.merge.is_empty());
+        let movies = &library.subdirs["Movies"];
+        assert_eq!(movies.merge.len(), 2);
+        assert_eq!(movies.dedupe_depth, Some(1));
+    }
+
+    #[test]
+    fn load_parses_subdir_path_shorthand() {
+        // The legacy shorthand — a bare path under `subdirs:` — must still
+        // parse to a single-merge ShareConfig.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "shares:\n  Library:\n    subdirs:\n      TV: /tmp/tv\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("load");
+        let tv = &cfg.shares["Library"].subdirs["TV"];
+        assert_eq!(tv.merge, vec![PathBuf::from("/tmp/tv")]);
+        assert!(tv.subdirs.is_empty());
+        assert_eq!(tv.dedupe_depth, None);
     }
 
     #[test]

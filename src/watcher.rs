@@ -111,36 +111,57 @@ pub fn collect_roots(config: &Config, tree: &Tree) -> Vec<WatchRoot> {
     else {
         return out;
     };
+
+    fn walk(
+        tree: &Tree,
+        node_id: NodeId,
+        share_cfg: &crate::config::ShareConfig,
+        out: &mut Vec<WatchRoot>,
+    ) {
+        // Priority 0 is reserved for subdirs (which always win at their
+        // parent's slot over a merge entry of the same name). Merges start
+        // at 1 so the priority spaces don't overlap.
+        for (idx, r) in share_cfg.merge.iter().enumerate() {
+            out.push(WatchRoot {
+                physical: r.clone(),
+                virtual_id: node_id,
+                priority: idx + 1,
+            });
+        }
+        let Some(node) = tree.get(node_id) else {
+            return;
+        };
+        let NodeKind::Directory { by_name, .. } = &node.kind else {
+            return;
+        };
+        for (subdir_name, sub_cfg) in &share_cfg.subdirs {
+            let Some(&subdir_id) = by_name.get(subdir_name) else {
+                continue;
+            };
+            // Single-merge-no-nesting subdir: behaves like the legacy
+            // path-only subdir form — one watched root, priority 0.
+            // Otherwise recurse so nested merges/subdirs each get their
+            // own WatchRoot at the right node.
+            let single_merge = sub_cfg.merge.len() == 1
+                && sub_cfg.subdirs.is_empty()
+                && sub_cfg.dedupe_depth.is_none();
+            if single_merge {
+                out.push(WatchRoot {
+                    physical: sub_cfg.merge[0].clone(),
+                    virtual_id: subdir_id,
+                    priority: 0,
+                });
+            } else {
+                walk(tree, subdir_id, sub_cfg, out);
+            }
+        }
+    }
+
     for (share_name, share_id) in shares {
         let Some(share_cfg) = config.shares.get(share_name) else {
             continue;
         };
-        let share_id = *share_id;
-        // Priority 0 is reserved for subdirs (see builder.rs ScanJob).
-        // Merges start at 1 so subdirs always outrank a colliding merge
-        // entry without ties.
-        for (idx, r) in share_cfg.merge.iter().enumerate() {
-            out.push(WatchRoot {
-                physical: r.clone(),
-                virtual_id: share_id,
-                priority: idx + 1,
-            });
-        }
-        let Some(share_node) = tree.get(share_id) else {
-            continue;
-        };
-        let NodeKind::Directory { by_name, .. } = &share_node.kind else {
-            continue;
-        };
-        for (subdir_name, r) in &share_cfg.subdirs {
-            if let Some(subdir_id) = by_name.get(subdir_name) {
-                out.push(WatchRoot {
-                    physical: r.clone(),
-                    virtual_id: *subdir_id,
-                    priority: 0,
-                });
-            }
-        }
+        walk(tree, *share_id, share_cfg, &mut out);
     }
     out
 }
@@ -563,7 +584,13 @@ mod tests {
                 merge: vec![m1.path().to_path_buf(), m2.path().to_path_buf()],
                 subdirs: {
                     let mut m = BTreeMap::new();
-                    m.insert("Archive".to_string(), archive.path().to_path_buf());
+                    m.insert(
+                        "Archive".to_string(),
+                        ShareConfig {
+                            merge: vec![archive.path().to_path_buf()],
+                            ..Default::default()
+                        },
+                    );
                     m
                 },
                 dedupe_depth: None,

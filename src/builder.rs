@@ -923,11 +923,96 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
         root_priority: usize,
     }
     let mut jobs: Vec<ScanJob> = Vec::new();
-    // Per-share subdir names. The doc'd contract is that a subdir shadows any
-    // top-level merge entry of the same name (and the collision is logged).
-    // Without this set the recursive merge would descend into the subdir's
-    // virtual dir and pollute it with files from the merge root.
+    // Subdir names per parent virtual id. The doc'd contract is that a
+    // subdir shadows any same-named entry contributed by the parent's merge
+    // roots (collision is logged at apply time). Without this set the
+    // recursive merge would descend into the subdir's virtual dir and
+    // pollute it with files from the merge root.
     let mut subdir_names_per_share: HashMap<NodeId, HashSet<String>> = HashMap::new();
+
+    /// Walk one share-shaped config rooted at `parent_id`, populating jobs
+    /// and the subdir-shadow set. Recurses through nested `subdirs:`.
+    fn build_share_jobs(
+        tree: &mut Tree,
+        parent_id: NodeId,
+        label: &str,
+        share: &crate::config::ShareConfig,
+        jobs: &mut Vec<ScanJob>,
+        subdir_names_per_share: &mut HashMap<NodeId, HashSet<String>>,
+    ) {
+        // Subdirs first so their names take precedence over same-named
+        // entries in merge roots at this level.
+        for (subdir_name, sub_cfg) in &share.subdirs {
+            let Some(subdir_id) = tree.add_child(
+                parent_id,
+                subdir_name.clone(),
+                NodeKind::empty_dir(),
+                CachedAttrs::synthetic_dir(),
+            ) else {
+                warn!(parent = %label, subdir = %subdir_name, "subdir name conflicts; skipping");
+                continue;
+            };
+            subdir_names_per_share
+                .entry(parent_id)
+                .or_default()
+                .insert(subdir_name.clone());
+
+            // Backwards-compatible single-path subdir: one merge root, no
+            // dedupe, no nested subdirs. Tag the ScanJob with `is_subdir`
+            // so phase 3 schedules it ahead of its parent's merge entries.
+            // Subdirs that themselves declare `merge:` or `subdirs:` are
+            // recursed into and contribute their own (non-`is_subdir`)
+            // jobs at the subdir's id.
+            let subdir_label = format!("{label}/{subdir_name}");
+            let only_one_merge_no_nesting = sub_cfg.merge.len() == 1
+                && sub_cfg.subdirs.is_empty()
+                && sub_cfg.dedupe_depth.is_none();
+            if only_one_merge_no_nesting {
+                let root = &sub_cfg.merge[0];
+                if root.exists() {
+                    jobs.push(ScanJob {
+                        target_id: subdir_id,
+                        physical: root.clone(),
+                        is_subdir: true,
+                        label: format!("{subdir_label}:subdir:{}", root.display()),
+                        dedupe_remaining: None,
+                        root_priority: 0,
+                    });
+                } else {
+                    warn!(share=%subdir_label, root=%root.display(), "subdir root missing; skipping");
+                }
+            } else {
+                build_share_jobs(
+                    tree,
+                    subdir_id,
+                    &subdir_label,
+                    sub_cfg,
+                    jobs,
+                    subdir_names_per_share,
+                );
+            }
+        }
+
+        for (idx, root) in share.merge.iter().enumerate() {
+            if !root.exists() {
+                warn!(share=%label, root=%root.display(), "merge root missing; skipping");
+                continue;
+            }
+            jobs.push(ScanJob {
+                target_id: parent_id,
+                physical: root.clone(),
+                is_subdir: false,
+                label: format!("{label}:merge:{}", root.display()),
+                dedupe_remaining: share.dedupe_depth.map(|d| d.saturating_sub(1)),
+                // Priority 0 is reserved for subdirs (which always win at
+                // their parent's slot over a merge entry of the same name).
+                // Merge roots start at 1 so the priority spaces don't
+                // overlap and a tied collision between merge[0] and a
+                // subdir name is impossible.
+                root_priority: idx + 1,
+            });
+        }
+    }
 
     for (share_name, share) in &config.shares {
         let share_id = tree
@@ -939,52 +1024,14 @@ pub fn build(config: &Config, server_id: u64) -> Result<Tree> {
             )
             .ok_or_else(|| anyhow::anyhow!("duplicate share name {share_name}"))?;
         info!(share = %share_name, id = share_id, "created share");
-
-        // Subdirs get a virtual node first so their names take precedence over
-        // any same-named entries in merge roots.
-        for (subdir_name, root) in &share.subdirs {
-            if let Some(subdir_id) = tree.add_child(
-                share_id,
-                subdir_name.clone(),
-                NodeKind::empty_dir(),
-                CachedAttrs::synthetic_dir(),
-            ) {
-                jobs.push(ScanJob {
-                    target_id: subdir_id,
-                    physical: root.clone(),
-                    is_subdir: true,
-                    label: format!("{share_name}:subdir:{subdir_name}"),
-                    dedupe_remaining: None,
-                    root_priority: 0,
-                });
-                subdir_names_per_share
-                    .entry(share_id)
-                    .or_default()
-                    .insert(subdir_name.clone());
-            } else {
-                warn!(share=%share_name, subdir=%subdir_name, "subdir name conflicts; skipping");
-            }
-        }
-
-        for (idx, root) in share.merge.iter().enumerate() {
-            if !root.exists() {
-                warn!(share=%share_name, root=%root.display(), "merge root missing; skipping");
-                continue;
-            }
-            jobs.push(ScanJob {
-                target_id: share_id,
-                physical: root.clone(),
-                is_subdir: false,
-                label: format!("{share_name}:merge:{}", root.display()),
-                dedupe_remaining: share.dedupe_depth.map(|d| d.saturating_sub(1)),
-                // Priority 0 is reserved for subdirs (which always win at
-                // the share-root level over any merge entry of the same
-                // name). Merges start at 1 so the priority spaces don't
-                // overlap and a tied collision between merge[0] and a
-                // subdir name is impossible.
-                root_priority: idx + 1,
-            });
-        }
+        build_share_jobs(
+            &mut tree,
+            share_id,
+            share_name,
+            share,
+            &mut jobs,
+            &mut subdir_names_per_share,
+        );
     }
 
     // Phase 2: snapshot every root in parallel. Each worker only needs
@@ -1475,7 +1522,13 @@ mod tests {
                 merge: vec![m1.path().to_path_buf(), m2.path().to_path_buf()],
                 subdirs: {
                     let mut m = BTreeMap::new();
-                    m.insert("Archive".to_string(), archive.path().to_path_buf());
+                    m.insert(
+                        "Archive".to_string(),
+                        ShareConfig {
+                            merge: vec![archive.path().to_path_buf()],
+                            ..Default::default()
+                        },
+                    );
                     m
                 },
                 dedupe_depth: None,
@@ -1514,7 +1567,13 @@ mod tests {
                 merge: vec![merge_root.path().to_path_buf()],
                 subdirs: {
                     let mut m = BTreeMap::new();
-                    m.insert("Archive".to_string(), subdir_root.path().to_path_buf());
+                    m.insert(
+                        "Archive".to_string(),
+                        ShareConfig {
+                            merge: vec![subdir_root.path().to_path_buf()],
+                            ..Default::default()
+                        },
+                    );
                     m
                 },
                 dedupe_depth: None,
@@ -1529,6 +1588,64 @@ mod tests {
             child_names(&tree, archive),
             vec!["from_subdir.mkv".to_string()]
         );
+    }
+
+    #[test]
+    fn build_subdir_supports_nested_merge_and_dedupe_depth() {
+        // A subdir is itself a share-shaped config: it can have multiple
+        // merge roots and its own `dedupe_depth`. Models the Infuse-friendly
+        // shape where one outer "Library" share groups inner "Movies" /
+        // "TV" subdirs that each merge across resolution-tier roots and
+        // dedupe at folder level.
+        let bluray = TempDir::new().unwrap();
+        let remux = TempDir::new().unwrap();
+        let p1080 = TempDir::new().unwrap();
+        // Same movie folder name in all three tiers — dedupe must keep
+        // only the highest-priority (Bluray) copy's contents.
+        touch(&bluray.path().join("Inception/main.mkv"));
+        touch(&remux.path().join("Inception/extras.mkv"));
+        touch(&p1080.path().join("Inception/lo.mkv"));
+        // Movie only in 1080p — must still appear, sourced from 1080p.
+        touch(&p1080.path().join("Heat/main.mkv"));
+
+        let mut shares = BTreeMap::new();
+        shares.insert(
+            "Library".to_string(),
+            ShareConfig {
+                merge: vec![],
+                subdirs: {
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "Movies".to_string(),
+                        ShareConfig {
+                            merge: vec![
+                                bluray.path().to_path_buf(),
+                                remux.path().to_path_buf(),
+                                p1080.path().to_path_buf(),
+                            ],
+                            subdirs: BTreeMap::new(),
+                            dedupe_depth: Some(1),
+                        },
+                    );
+                    m
+                },
+                dedupe_depth: None,
+            },
+        );
+        let cfg = cfg_for(shares);
+        let tree = build(&cfg, 0).expect("build");
+        let library = tree.child(ROOT_ID, "Library").unwrap();
+        let movies = tree.child(library, "Movies").unwrap();
+        let mut names = child_names(&tree, movies);
+        names.sort();
+        assert_eq!(names, vec!["Heat".to_string(), "Inception".to_string()]);
+        // Inception came from Bluray (highest priority); the other tiers
+        // are shadowed entirely, so only `main.mkv` is present.
+        let inception = tree.child(movies, "Inception").unwrap();
+        assert_eq!(child_names(&tree, inception), vec!["main.mkv".to_string()]);
+        // Heat exists only in 1080p; it's promoted as the winner there.
+        let heat = tree.child(movies, "Heat").unwrap();
+        assert_eq!(child_names(&tree, heat), vec!["main.mkv".to_string()]);
     }
 
     #[test]
